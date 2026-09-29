@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Copyright (C) 2026 KN6FLN
+# Copyright (C) 2026 Loren Weith
 #
 # Makefile - RLC-Club Dlx2 NVSRAM dumper firmware (MC68HC16Z1 / CPU16)
 #
