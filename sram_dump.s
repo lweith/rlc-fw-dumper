@@ -288,6 +288,13 @@ DONE:
         BRA     DONE            ; halt
 
 ;-----------------------------------------------------------------------
+; Copyright / license string embedded in the image (data only -- never
+; executed or printed; discoverable via `strings sram_dump.bin`).
+;-----------------------------------------------------------------------
+copyright:
+        DC.B    "sram_dump  Copyright (C) 2026 Loren Weith  GPL-3.0-or-later  NO WARRANTY",0
+
+;-----------------------------------------------------------------------
 ; Fixed completion string (explicit CRLF; printed verbatim).
 ;-----------------------------------------------------------------------
 donemsg:
