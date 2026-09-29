@@ -1,3 +1,6 @@
+; SPDX-License-Identifier: GPL-3.0-or-later
+; Copyright (C) 2026 KN6FLN
+;
 ;***********************************************************************
 ; sram_dump.s  -  Read-only NVSRAM dumper for an MC68HC16Z1 (CPU16) board
 ;
