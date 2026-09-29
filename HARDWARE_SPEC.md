@@ -40,10 +40,13 @@ nothing to the vendor's firmware.
   - **QSM** base `$FFC00`, containing the **SCI** (async UART):
     `SCCR0` `$FFC08` (baud rate register), `SCCR1` `$FFC0A` (enables: TE/RE, mode),
     `SCSR` `$FFC0C` (status: TDRE/RDRF/etc.), `SCDR` `$FFC0E` (data).
-    SCI baud = f_sys / (32 × SCBR); for 9600 baud at 16.78 MHz, SCBR ≈ 55 (`$37`).
+    SCI baud = f_sys / (32 × SCBR); at 16.78 MHz, SCBR 55 → ~9600, SCBR 27 → ~19200.
     The QSM pin-assignment/data-direction registers (`QPAR`/`QDDR`, near `$FFC15`) may need
     the SCI TXD/RXD pins assigned to the SCI — check the datasheet.
-- **Serial line settings:** **9600 baud, 8 data bits, no parity, 1 stop bit.**
+- **Serial line settings:** **8 data bits, no parity, 1 stop bit (8N1).** Baud is a build
+  knob — default **19200**. Per the RLC manual (command 024) the stock firmware supports
+  **300–19200**, so 19200 is the vendor-documented max; use **9600** for the first
+  on-hardware dump to match the stock clock exactly, then 19200/57600 for speed.
 
 ## Protocol
 
@@ -59,10 +62,12 @@ Standard **XMODEM** (checksum variant is fine; XMODEM-CRC optional):
 
 ## Build
 
-- Assemble with **asl**: `asl -cpu 68HC16 -L sram_dump.s` → `sram_dump.p`.
-- Convert to a flat binary: `p2bin sram_dump.p sram_dump.bin`.
-- **Pad to exactly 512 KB** (`$80000` bytes) — the boot image size. (`truncate -s 524288`
-  or emit padding in the source.)
+`make` (see the Makefile; knobs: `BAUD=` default 19200, `BANNER=`, `OUT=`), which runs:
+
+- Assemble with **asl**: `asl -cpu 68HC16 [-D SCBRVAL=n] -L sram_dump.s` → `sram_dump.p`.
+- Flatten to a full **512 KB** image with every unused cell `$FF`-filled (the erased-EPROM
+  state, so a burn writes only the used cells):
+  `p2bin sram_dump.p sram_dump.bin -l 0xff -r 0x0-0x7ffff`.
 
 ## Test harness (emulator, black box)
 
@@ -80,6 +85,7 @@ The image is booted by an MC68HC16Z1 emulator that presents the same memory map.
 ## Deliverables (in this directory)
 
 - `sram_dump.s` — the commented assembly source.
-- `build.sh` — assemble + convert + pad.
-- `sram_dump.bin` — the built 512 KB image.
+- `Makefile` — build with knobs (`BAUD`/`BANNER`/`OUT`); emits the `$FF`-filled 512 KB image.
+- `banner.txt` — boot banner embedded into the image (edit + rebuild, no source change).
+- `sram_dump.bin` — the built 512 KB image (git-ignored; regenerate with `make`).
 - `NOTES.md` — how you derived the init/banking from the datasheet, and test results.

@@ -7,8 +7,7 @@ decompilation, or RE notes were consulted.
 
 ## Build
 
-`./build.sh` (simple; default 19200 baud, banner from `banner.txt`), or the
-**Makefile** for knobs:
+Build with **`make`** (see the Makefile):
 
 ```
 make                  # default: banner.txt, 19200 baud, sram_dump.bin
@@ -18,7 +17,7 @@ make OUT=recover.bin  # name the output image
 make clean all        # force a full rebuild
 ```
 
-Both run: `asl -cpu 68HC16 [-D SCBRVAL=n] -L sram_dump.s` → `sram_dump.p`,
+It runs: `asl -cpu 68HC16 [-D SCBRVAL=n] -L sram_dump.s` → `sram_dump.p`,
 then `p2bin sram_dump.p sram_dump.bin -l 0xff -r 0x0-0x7ffff`. The `-r` spans
 the full 512 KB boot window and `-l 0xff` fills every unused cell with **`$FF`**
 (the erased-EPROM/flash state), so a programmer skips the blank cells and burns
