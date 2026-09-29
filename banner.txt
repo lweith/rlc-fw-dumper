@@ -1,0 +1,14 @@
+
+                 (__)
+                 (oo)
+           /------\/
+          / |    ||
+         *  /\---/\
+            ~~   ~~
+
+  RLC-Club Dlx2 config dumper v1.0 de KN6FLN
+
+Source: NVSRAM $F80000-$FBFFFF, 256 KB
+Xfer:   XMODEM checksum, 2048 x 128B, 9600 8N1
+
+Start your XMODEM receiver now...

@@ -1,0 +1,4 @@
+# Build artifacts — regenerate with `make` (or ./build.sh)
+*.bin
+*.p
+*.lst
