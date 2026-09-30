@@ -29,7 +29,9 @@ STEM    := $(basename $(SRC))
 BAUD    ?= 19200
 # SCBR = SCI divisor computed (rounded) from BAUD at f_sys = 16.777216 MHz
 SCBR    := $(shell echo $$(( (16777216 + 16*$(BAUD)) / (32*$(BAUD)) )))
-# BANNER = file embedded into the image (override: make BANNER=other.txt)
+# BANNER = file embedded into the image (override: make BANNER=other.txt).
+#          The token @BAUD@ inside it is replaced with the BAUD value at build time,
+#          so the banner's advertised rate always matches what the firmware runs.
 BANNER  ?= banner.txt
 # OUT = output image name (override: make OUT=recover.bin)
 OUT     ?= sram_dump.bin
@@ -46,7 +48,7 @@ all: $(OUT)
 
 # Rebuild whenever the source OR the chosen banner file changes.
 $(OUT): $(SRC) $(BANNER)
-	cp -f "$(BANNER)" $(STAGE)
+	sed 's/@BAUD@/$(BAUD)/g' "$(BANNER)" > $(STAGE)
 	$(ASL) -cpu $(CPU) -D SCBRVAL=$(SCBR) -L $(SRC)
 	$(P2BIN) $(STEM).p $(OUT) -l $(FILL) -r 0x0-$(IMGTOP)
 	@echo "built $(OUT) from banner '$(BANNER)' at $(BAUD) baud (SCBR=$(SCBR)):"
