@@ -37,11 +37,14 @@ CSPAR0  EQU     $FA44           ; Chip-select pin assignment 0 (word)
 CSBAR0  EQU     $FA4C           ; CS0 base address register (word)
 CSOR0   EQU     $FA4E           ; CS0 option register (word)
 ;
-; CS0 frames the two SRAMs (U14/U15, one per byte lane) as one 16-bit port at
-; $F80000, 256 KB (board map).  Out of reset only CSBOOT is live, so without
-; this every SRAM access waits forever for a DSACK that never comes (and with
-; the bus monitor off, nothing breaks the wait: the DS1232 resets the board).
-CSP0_16 EQU     $000C           ; CSPAR0 bits 3:2 (CS0 field) = %11: 16-bit chip select
+; CS0 frames the two SRAMs (U14/U15) at $F80000, 256 KB (board map).  Both
+; SRAMs -- like the boot ROM -- sit on D15-D8 only, so CS0 is an 8-BIT port;
+; as a 16-bit port, odd addresses read the unconnected D7-D0 lane (floating:
+; junk decaying to $00; found on silicon, invisible in MAME).  Out of reset
+; only CSBOOT is live, so without this every SRAM access waits forever for a
+; DSACK that never comes (bus monitor off: the DS1232 resets the board).
+CSP0_MSK EQU    $000C           ; CSPAR0 bits 3:2 = CS0 field
+CSP0_8  EQU     $0008           ; CS0 field = %10: 8-bit chip select
 CSB0VAL EQU     $F805           ; CSBAR0: base $F80000 (A23-A11 in 15:3), BLKSZ %101 = 256K
 ; CSOR0: MODE=0 async | BYTE=%11 both | R/W=%11 both | STRB=0 AS |
 ;        DSACK=%0010 (2 wait states; 70 ns parts, 60 ns clock) | SPACE=%11 S/U |
@@ -291,8 +294,9 @@ START:
 ; the boot port width (8-bit for the 27C040) and must be left as reset set it.
 ; Derived from the HC16Z1 SIM chip-select register layout + the board map.
         LDD     CSPAR0
-        ORD     #CSP0_16
-        STD     CSPAR0          ; CS0 pin = 16-bit chip select
+        ANDD    #~CSP0_MSK
+        ORD     #CSP0_8
+        STD     CSPAR0          ; CS0 pin = 8-bit chip select
         LDD     #CSB0VAL
         STD     CSBAR0          ; $F80000, 256 KB
         LDD     #CSO0VAL

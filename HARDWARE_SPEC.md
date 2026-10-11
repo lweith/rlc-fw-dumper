@@ -28,8 +28,10 @@ nothing to the vendor's firmware.
   CSBOOT), image size **512 KB (`$00000–$7FFFF`)**. The CPU16 fetches its reset vector from
   `$000000` (see the datasheet for the reset-vector word layout: initial K/CCR, PC, SP, IZ).
 - **Data to dump:** **256 KB** of external battery-backed SRAM — two **NEC μPD431000A-70LL**
-  devices (128K×8, 1 Mbit, 70 ns, low-standby "LL" data-retention grade) forming a 128K×16
-  bus (hence the byte order: even addresses in one device, odd in the other). These are
+  devices (128K×8, 1 Mbit, 70 ns, low-standby "LL" data-retention grade). Both SRAMs — like
+  the boot ROM — are wired to **D15–D8 only: CS0 is an 8-bit port**, and the board's own
+  decode picks the device; D7–D0 is unconnected for them (a 16-bit CS0 reads floating junk
+  on odd addresses — confirmed on silicon; MAME's 16-bit share hides it). These are
   **ordinary SRAM**, not internal-battery nvSRAM; retention comes from an external cell (BT1)
   through a backup-power switch, and the board's Dallas part (DS1286) is **RTC-only**. On
   chip-select **CS0**, occupying **`$F80000–$FBFFFF`** in the CPU's 24-bit
@@ -39,8 +41,9 @@ nothing to the vendor's firmware.
 - **On-chip modules** (standard HC16Z1 map, module space at `$FFxxx`, bank `$F`):
   - **SIM** base `$FFA00`. Relevant: `SYNCR` `$FFA04` (clock synthesizer), `SYPCR` `$FFA21`
     (COP watchdog / bus monitor — disable or service the COP so it doesn't reset you),
-    chip-select pin assignment/base/option registers `$FFA44`+ (only needed if CS0 must be
-    programmed to see the SRAM on real hardware).
+    chip-select pin assignment/base/option registers `$FFA44`+ — **required on real
+    hardware**: out of reset only CSBOOT is live, and an access through an unprogrammed CS0
+    never gets DSACK (with the bus monitor off it hangs until the DS1232 resets the board).
     - **Clock:** out of reset the synthesizer runs at `f_ref·4·(Y+1)·2^(2W+X)` with
       `SYNCR = $3F00` (Y=$3F, W=X=0) ⇒ `32768·4·64 = 8.39 MHz` — **half** the board's
       16.78 MHz. The SCI baud divisor is computed for 16.78 MHz, so **program `SYNCR`**
