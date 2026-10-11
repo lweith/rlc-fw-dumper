@@ -31,6 +31,7 @@
 ; ZK = $F and Z = QSM base, indexed operand off Z reaches the same space.
 ;
 ; SIM (base $FFA00):
+SYNCR   EQU     $FA04           ; Clock Synthesizer CR (word)  -> set f_sys
 SYPCR   EQU     $FA21           ; System Protection CR (byte) -> disable COP
 ;
 ; QSM (base $FFC00) - Z points here at run time (Z = $FC00, ZK = $F):
@@ -40,6 +41,8 @@ SCCR1   EQU     $0A             ; offset of SCI Control Reg 1 (enables)$FFC0A
 SCSR_HI EQU     $0C             ; SCI Status high byte ($FFC0C): TDRE = bit0
 SCSR_LO EQU     $0D             ; SCI Status low  byte ($FFC0D): RDRF = bit6
 SCDR    EQU     $0E             ; SCI Data Register (16-bit) $FFC0E; data = low
+PORTQS  EQU     $15             ; QSM port QS data             $FFC15
+DDRQS   EQU     $17             ; QSM data-direction register  $FFC17
 ;
 ; SCI status bit masks (within the byte tested):
 TDRE    EQU     $01             ; SCSR bit 8  -> bit0 of high byte
@@ -81,23 +84,68 @@ LF      EQU     $0A             ; line feed
 BLKSZ   EQU     128             ; XMODEM data bytes per block
 
 ;-----------------------------------------------------------------------
-; SENDB : transmit the byte in accumulator B over the SCI.
-;   Polls TDRE (SCSR bit8 = bit0 of SCSR_HI) then writes SCDR.
-;   Uses a 16-bit store of D (A:B) to SCDR: A -> high byte (T8/unused,
-;   ignored in 8-bit mode), B -> low byte (the data).  Preserves A and B,
-;   so it is safe to call from inside the data loop where A = checksum.
+; [main-session addition] Serial monitor ("cow monitor") selection + opcodes.
+; After the banner the firmware waits for one byte to pick a mode:
+;   NAK ($15) -> XMODEM dump (below, unchanged)
+;   'g'/'G'   -> interactive monitor (peek/poke/registers) for live debugging.
+; Clean-room: CPU16 datasheet register map + SCI only; no vendor firmware.
+MON_G   EQU     $67             ; 'g' : enter monitor
+MON_GU  EQU     $47             ; 'G' : enter monitor (upper)
+CMD_V   EQU     $56             ; 'V' : version/ping   -> "COW1",CR,LF
+CMD_R   EQU     $52             ; 'R' : read  bank,hi,lo,count -> count bytes
+CMD_W   EQU     $57             ; 'W' : write bank,hi,lo,data  -> 'K'
+CMD_X   EQU     $58             ; 'X' : read SYNCR (clock/SLOCK) -> hi,lo
+CMD_J   EQU     $4A             ; 'J' : jump hi,lo (bank-0 program space; experimental)
+ACKCHR  EQU     $4B             ; 'K' : write acknowledge
+; Scratch cell for assembling a 24-bit pointer from received bytes (CPU16 has
+; no D->X transfer, so the address bytes land here and LDX pulls the offset).
+; Placed in the firmware-idle SRAM gap so it never touches config; Y (YK=$F8)
+; points at it for the whole monitor session.
+SCRBNK  EQU     $F8             ; scratch bank (SRAM CS0)
+SCROFF  EQU     $E000           ; scratch offset -> $F8E000 (idle gap)
+
+;-----------------------------------------------------------------------
+; STROBE : pulse PQS1 (high->low) to service the EXTERNAL DS1232 watchdog
+;   (U24), whose /ST input is wired to PQS1 (board schematic: U24 pin 7 <->
+;   HC16 pin 11 = MOSI = PQS1).  Disabling the on-chip COP (SYPCR) does NOT
+;   touch this external part; left unstrobed it resets the board within its
+;   timeout, far shorter than the multi-minute dump.  Clobbers B; PRESERVES
+;   A -- safe after a checksum-bearing SENDB.  Needs Z = QSM base and DDRQS
+;   bit1 already an output.
+;-----------------------------------------------------------------------
+; PORTQS bit7 (TXD as GPIO) is held at 1 in both writes so the line idles at
+; mark rather than break whenever the SCI is not driving it.
+STROBE  MACRO
+        LDAB    #$82                    ; PQS1 = 1  (PQS7 = 1)
+        STAB    PORTQS,Z
+        LDAB    #$80                    ; PQS1 = 0  (edge resets the DS1232)
+        STAB    PORTQS,Z
+        ENDM
+
+;-----------------------------------------------------------------------
+; SENDB : transmit the byte in accumulator B over the SCI, then strobe the
+;   watchdog.  Polls TDRE (SCSR bit8 = bit0 of SCSR_HI) then writes SCDR:
+;   a 16-bit store of D (A:B) -> A to the high byte (T8/unused in 8-bit
+;   mode), B to the data byte.  A survives the whole macro (STROBE touches
+;   only B, which is no longer needed once the byte is queued), so this is
+;   safe in the data loop where A = running checksum.
 ;-----------------------------------------------------------------------
 SENDB   MACRO
         BRCLR   SCSR_HI,Z,#TDRE,*       ; spin here until transmitter ready
         STD     SCDR,Z                  ; write data (B) to SCI data register
+        STROBE                          ; feed the watchdog on every byte sent
         ENDM
 
 ;-----------------------------------------------------------------------
-; RECVB : block until a byte arrives; return it in B (A clobbered).
-;   Poll RDRF, then read SCDR (clears RDRF).
+; RECVB : block until a byte arrives; return it in B (A,B clobbered).  The
+;   wait (handshake, per-block ACK, final ACK) is receiver-paced and can
+;   exceed the watchdog timeout, so the spin strobes PQS1 every pass.
 ;-----------------------------------------------------------------------
-RECVB   MACRO
-        BRCLR   SCSR_LO,Z,#RDRF,*       ; spin here until receive data ready
+; lbl = a caller-supplied unique label for the strobing spin (asl has no
+; one-liner for a macro-local label, and this macro is used at >1 site).
+RECVB   MACRO   lbl
+lbl:    STROBE                          ; feed the watchdog while waiting
+        BRCLR   SCSR_LO,Z,#RDRF,lbl     ; spin until receive data ready
         LDD     SCDR,Z                  ; read data -> B (low), clears RDRF
         ENDM
 
@@ -132,16 +180,39 @@ START:
         TBXK                    ; XK = $F8 : X-indexed reads hit SRAM bank 0
         LDX     #$0000          ; X = offset 0 within the SRAM bank
 
-; --- Disable COP watchdog / bus monitor ------------------------------
-; The transfer takes minutes at 9600 baud, far longer than any COP
-; timeout, so the software watchdog must be off.  SYPCR bit7 (SWE) = 0
-; disables it; writing $00 also clears the bus/halt monitors.
+; --- Disable COP watchdog / bus monitor (FIRST) -----------------------
+; The on-chip COP comes out of reset ENABLED with a short timeout, so kill it
+; before doing anything else.  SYPCR bit7 (SWE)=0 disables it, and writing $00
+; also clears the bus/halt monitors.  (The EXTERNAL DS1232 is a separate part,
+; serviced by STROBE, not by this register.)
         CLRA
         STAA    SYPCR           ; SYPCR = $00  (EK=$F -> $FFA21)
 
+; --- Watchdog strobe pin + TXD pin -----------------------------------
+; PQS1 drives the external DS1232 (U24) /ST input (board schematic: U24 pin 7
+; <-> HC16 pin 11 = MOSI = PQS1).  PQSPAR bit1 = 0 (reset default) already
+; leaves PQS1 a general-purpose pin; make it an output so STROBE can pulse it.
+;
+; Bit 7 (PQS7) is the SCI TXD pin, also made an output.  Until TE is set it is
+; a plain GPIO driving PORTQS bit7, so PORTQS is preloaded with bit7 = 1 (line
+; idle / mark) BEFORE DDRQS turns the driver on, and STROBE keeps bit7 high.
+; Otherwise TXD sits low (a break) whenever the SCI is not driving it.
+        LDAB    #$80
+        STAB    PORTQS,Z        ; PQS7 = 1 (mark), PQS1 = 0
+        LDAB    #$82
+        STAB    DDRQS,Z         ; DDRQS: PQS7=TXD + PQS1=/ST, both outputs ($FFC17)
+
+; --- System clock synthesizer ----------------------------------------
+; Out of reset the HC16Z1 synthesizer runs at f_ref*4*(Y+1)*2^(2W+X) with
+; Y=$3F, W=X=0 -> 32768*4*64 = 8.39 MHz.  Program W=0, X=1, Y=$3F ->
+; *4*64*2 = 16.777216 MHz, the board's f_sys (HARDWARE_SPEC).  X only switches
+; a divider outside the VCO loop, so no relock is needed and there is no wait.
+        LDD     #$7F00          ; SYNCR: W=0 X=1 Y=$3F -> 16.78 MHz
+        STD     SYNCR           ; (EK=$F -> $FFA04)
+
 ; --- Bring up the SCI ------------------------------------------------
         LDD     #SCBRVAL
-        STD     SCCR0,Z         ; baud = f_sys/(32*SCBR), SCBR=55 -> ~9600
+        STD     SCCR0,Z         ; baud = f_sys/(32*SCBR), SCBR=27 -> ~19200
         LDD     #TE_RE
         STD     SCCR1,Z         ; enable TX + RX, 8 data bits, no parity, 1 stop
 
@@ -179,17 +250,25 @@ PRBSEND:
 PRBANX:
         LDX     #$0000          ; restore SRAM read offset for the transfer
 
-        LDE     #EINIT          ; E high = bank tracker ($F8), E low = block# 1
-
 ;-----------------------------------------------------------------------
-; Handshake: wait for the receiver's start byte.  We run checksum mode,
-; so we wait specifically for NAK ($15) and ignore anything else
-; (a CRC-mode 'C' is ignored; a standard receiver falls back to NAK).
+; [main-session addition] Mode select.  After the banner, one byte chooses:
+;   NAK ($15) -> XMODEM dump (original behaviour; a stock XMODEM receiver sends
+;                NAK to start, so the dump stays turnkey)
+;   'g'/'G'   -> interactive serial monitor (peek/poke/registers)
+; Anything else is ignored.  The wait STROBEs the DS1232 (via RECVB) and has no
+; timeout: we wait for an explicit trigger byte.
 ;-----------------------------------------------------------------------
-HANDSHK:
-        RECVB
+SELECT:
+        RECVB   rsel
         CMPB    #NAK
-        BNE     HANDSHK
+        BEQ     DODUMP
+        CMPB    #MON_G
+        LBEQ    MONITOR
+        CMPB    #MON_GU
+        LBEQ    MONITOR
+        BRA     SELECT          ; ignore anything else, keep feeding the dog
+DODUMP:
+        LDE     #EINIT          ; E high = bank tracker ($F8), E low = block# 1
 
 ;-----------------------------------------------------------------------
 ; Main block loop.
@@ -202,10 +281,13 @@ HANDSHK:
 ;-----------------------------------------------------------------------
 BLOCK:
         ; ---- header: SOH, blocknum, ~blocknum ----
+        ; SENDB's watchdog STROBE clobbers B, so reload the block number from E
+        ; (which STROBE never touches) before forming its complement.
         LDAB    #SOH
         SENDB
         TED                     ; D <- E ; B = E low = block number (A = bank)
         SENDB                   ; send block number
+        TED                     ; reload block number into B (E is unchanged)
         COMB                    ; B = ~block number
         SENDB                   ; send block-number complement
 
@@ -227,7 +309,7 @@ DATA:
 
         ; ---- wait for ACK / NAK ----
 WACK:
-        RECVB
+        RECVB   rwack
         CMPB    #ACK
         BEQ     ACKED
         CMPB    #NAK
@@ -236,7 +318,7 @@ WACK:
 
 RESEND:
         AIX     #-BLKSZ         ; rewind pointer to start of this block
-        BRA     BLOCK           ; resend same block (same block number)
+        LBRA    BLOCK           ; resend same block (long branch: block grew)
 
 ACKED:
         ; advance block number (E low byte), leaving the bank (E high) alone
@@ -245,7 +327,7 @@ ACKED:
         TDE                     ; E = bank:blocknum
         ; did X just wrap past the end of a 64 KB bank?
         CPX     #0
-        BNE     BLOCK           ; still inside this bank -> next block
+        LBNE    BLOCK           ; still inside this bank -> next block (long)
         ; bank finished: step to the next SRAM bank.
         ; The bank is tracked in E's high byte and incremented with accumulator
         ; arithmetic, then WRITTEN to XK; XK is never read back.
@@ -256,7 +338,7 @@ ACKED:
         TBXK                    ; XK = new bank  (write only)
         ANDB    #$0F            ; banks used have nibble 8,9,A,B; $C means done
         CMPB    #BANKEND
-        BNE     BLOCK           ; more banks remain (X is already 0)
+        LBNE    BLOCK           ; more banks remain (X is already 0) (long)
 
 ;-----------------------------------------------------------------------
 ; End of transfer: send EOT, wait for ACK (resend EOT otherwise), stop.
@@ -264,7 +346,7 @@ ACKED:
 SENDEOT:
         LDAB    #EOT
         SENDB
-        RECVB
+        RECVB   reot
         CMPB    #ACK
         BNE     SENDEOT
 
@@ -286,6 +368,107 @@ PRDON:
 
 DONE:
         BRA     DONE            ; halt
+
+;-----------------------------------------------------------------------
+; [main-session addition] Interactive serial monitor ("cow monitor").
+; Entered from SELECT on 'g'/'G'.  Single-letter commands over the same SCI:
+;   'V'                      -> "COW1",CR,LF           (ping / baud confirm)
+;   'X'                      -> SYNCR hi, SYNCR lo     (clock + SLOCK state)
+;   'R' bank hi lo count     -> <count> bytes from bank:hi:lo (count 0 => 256)
+;   'W' bank hi lo data      -> writes one byte, replies 'K'
+;   'J' hi lo                -> JMP to bank-0 program address hi:lo (experimental)
+; Multi-byte addresses are assembled through the SCROFF scratch cell (CPU16 has
+; no D->X transfer).  'V' and 'X' touch no RAM, so they answer even if external
+; SRAM is dead -- 'X' is the live clock probe (SYNCR; SLOCK = lo bit3).  Every
+; SENDB / RECVB feeds the DS1232.  Clean-room: CPU16 register map + SCI only.
+;-----------------------------------------------------------------------
+MONITOR:
+        LDAB    #SCRBNK
+        TBYK                    ; YK = $F8 : Y-indexed stores hit the SRAM scratch
+        LDY     #SCROFF         ; Y -> $F8E000 (firmware-idle gap)
+MONLOOP:
+        RECVB   rmon            ; B = command byte
+        CMPB    #CMD_V
+        LBEQ    MON_V
+        CMPB    #CMD_X
+        LBEQ    MON_X
+        CMPB    #CMD_R
+        LBEQ    MON_R
+        CMPB    #CMD_W
+        LBEQ    MON_W
+        CMPB    #CMD_J
+        LBEQ    MON_J
+        BRA     MONLOOP         ; unknown command -> ignore, resync
+
+MON_V:
+        LDAB    #$43            ; 'C'
+        SENDB
+        LDAB    #$4F            ; 'O'
+        SENDB
+        LDAB    #$57            ; 'W'
+        SENDB
+        LDAB    #$31            ; '1'
+        SENDB
+        LDAB    #CR
+        SENDB
+        LDAB    #LF
+        SENDB
+        LBRA    MONLOOP
+
+MON_X:
+        LDD     SYNCR           ; A = SYNCR hi, B = SYNCR lo
+        TAB                     ; B = hi
+        SENDB                   ; send hi  (SENDB preserves A)
+        LDD     SYNCR           ; re-read: A = hi, B = lo (SYNCR is stable)
+        SENDB                   ; send lo
+        LBRA    MONLOOP
+
+MON_R:
+        RECVB   rr1
+        STAB    2,Y             ; [2] = bank
+        RECVB   rr2
+        STAB    0,Y             ; [0] = addr hi
+        RECVB   rr3
+        STAB    1,Y             ; [1] = addr lo
+        RECVB   rr4
+        STAB    3,Y             ; [3] = count (0 means 256)
+        LDAB    2,Y
+        TBXK                    ; XK = bank
+        LDX     0,Y             ; X = hi:lo
+        LDAA    3,Y             ; A = count (survives SENDB)
+MONRLP:
+        LDAB    0,X             ; read one byte at XK:X
+        SENDB                   ; send it
+        AIX     #1
+        DECA
+        BNE     MONRLP
+        LBRA    MONLOOP
+
+MON_W:
+        RECVB   rw1
+        STAB    2,Y             ; bank
+        RECVB   rw2
+        STAB    0,Y             ; addr hi
+        RECVB   rw3
+        STAB    1,Y             ; addr lo
+        RECVB   rw4
+        STAB    3,Y             ; data
+        LDAB    2,Y
+        TBXK                    ; XK = bank
+        LDX     0,Y             ; X = hi:lo
+        LDAB    3,Y             ; data
+        STAB    0,X             ; write XK:X = data
+        LDAB    #ACKCHR
+        SENDB                   ; 'K'
+        LBRA    MONLOOP
+
+MON_J:
+        RECVB   rj1
+        STAB    0,Y             ; addr hi
+        RECVB   rj2
+        STAB    1,Y             ; addr lo
+        LDX     0,Y             ; X = hi:lo
+        JMP     0,X             ; jump within current program bank (PK=0)
 
 ;-----------------------------------------------------------------------
 ; Copyright / license string embedded in the image (data only -- never

@@ -50,19 +50,36 @@ relying on reset defaults:
   QSM: `off,Z` with off = register offset from `$FFC00`.
 - `XK = $F8`, `X = $0000` (`TBXK`, `LDX`) — **X-indexed** reads hit the SRAM.
 
-## SIM init — disabling the COP
+## SIM init — clock, and TWO watchdogs
 
 The transfer moves ~272 KB on the wire (2048 × 133 bytes). Even at 57600 baud
-that is ~47 s (at 9600 it is ~4.7 min), far longer than any COP timeout, so the
-software watchdog must be off. `SYPCR` (`$FFA21`) bit7 `SWE` = 0 disables the
-software watchdog; writing `$00` also clears the bus/halt monitors. Done once,
-early (`CLRA; STAA $FA21`), within the write-once window after reset.
+that is ~47 s (at 9600 it is ~4.7 min), far longer than any watchdog timeout.
+There are **two** watchdogs on this board; both must be handled.
 
-`SYNCR` (clock synthesizer, `$FFA04`) is **left at its reset/board default**.
-`HARDWARE_SPEC.md` states f_sys ≈ 16.777216 MHz as a hardware fact, so the
-baud divisor is computed for that clock. If the emulator/board comes up at a
-different f_sys, only `SCBRVAL` needs adjusting (see below). **Assumption to
-verify.**
+**On-chip COP.** `SYPCR` (`$FFA21`) bit7 `SWE` = 0 disables the software
+watchdog; writing `$00` also clears the bus/halt monitors. Done once, as the
+**first** SIM write (`CLRA; STAA $FA21`): the COP is enabled out of reset with a
+short timeout, so nothing slow may run ahead of it.
+
+**External DS1232 (U24).** `SYPCR` does **not** touch this hardware part — it
+pulls `/RESET` unless its `/ST` strobe is toggled within ~0.6–1.2 s (TD=VCC).
+Per the board schematic its `/ST` is on **PQS1** (QSM `PORTQS` bit 1; net "ST"
+→ U16 pin 11 = MOSI = PQS1). We make PQS1 a `DDRQS` output and pulse it on
+**every transmitted byte** (in `SENDB`) and **every receive-wait pass** (in
+`RECVB`) via the `STROBE` macro — which uses `B` only, preserving the checksum
+in `A`. (The block header reloads the block number from `E` after a `SENDB`
+because `STROBE` clobbers `B`.) Without this, the real board reset-loops about
+once a second and no dump completes — a failure invisible until the emulator
+also modelled the DS1232.
+
+**Clock (`SYNCR`, `$FFA04`).** Out of reset the synthesizer gives
+`f_ref·4·(Y+1)·2^(2W+X)` = `32768·4·64·1` = **8.39 MHz**, half the board's
+16.78 MHz, while the baud divisor is computed for 16.78 MHz. So program
+`SYNCR` = `$7F00` (W=0, X=1, Y=$3F): setting X doubles the clock to 16.777216
+MHz with no VCO relock. Value derived from the datasheet synthesizer equation
+and the 16.78 MHz target in `HARDWARE_SPEC.md`. (MAME's CPU16 runs at a fixed
+clock and ignores `SYNCR`, so this one is datasheet-proven, not emulator-proven;
+the baud is socket-irrelevant in the test bench anyway.)
 
 ## SCI (QSM) init and baud
 
@@ -233,6 +250,11 @@ config. It is also why an on-device hash (MD5 / CRC-32 / sum-32) is impractical
 - Full 256 KB dump = **byte-exact vs the real config (0 mismatches)** and vs a
   dense position-unique synthetic pattern; confirmed at 9600 and 19200 and after
   the FF-fill / baud-knob changes.
+- **With the DS1232 watchdog now modelled in MAME** (it was not when the core
+  was first verified): the strobe survives the handshake wait (0 resets, ~1.4M
+  `PORTQS` strobes/s) and completes the full 2048-block dump with 0 mismatches.
+  The earlier "verified" runs predated the emulated watchdog and would have
+  reset-looped on real hardware — the reason the watchdog + `SYNCR` fixes exist.
 - Banner prints correctly: cow + 12 CRLF pairs (12 LF / 12 CR, no lone LFs).
 - End-to-end run: banner → 2048/2048 blocks → `Done.` → 0 mismatches.
 - Baud is irrelevant over MAME's socket (byte-oriented); `SCBRVAL` matters only

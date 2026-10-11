@@ -1,8 +1,8 @@
 # SRAM-dump firmware — hardware specification (clean-room input)
 
 You are writing a small **boot firmware** for a Motorola **MC68HC16Z1** board. Its only job:
-after reset, bring up the serial port and transmit the board's 256 KB of external NVSRAM
-out the serial port using the **XMODEM** protocol, then stop. It must only **read** the
+after reset, bring up the serial port and transmit the board's 256 KB of external
+battery-backed SRAM out the serial port using the **XMODEM** protocol, then stop. It must only **read** the
 SRAM — never write to it or to any other board resource beyond what init requires.
 
 ## Clean-room rules (important)
@@ -27,8 +27,12 @@ nothing to the vendor's firmware.
 - **Boot memory:** the firmware runs from boot ROM/flash at **`$000000`** (chip-select
   CSBOOT), image size **512 KB (`$00000–$7FFFF`)**. The CPU16 fetches its reset vector from
   `$000000` (see the datasheet for the reset-vector word layout: initial K/CCR, PC, SP, IZ).
-- **Data to dump:** **256 KB** of external byte-wide NVSRAM (two DS1245Y devices forming a
-  16-bit bus) on chip-select **CS0**, occupying **`$F80000–$FBFFFF`** in the CPU's 24-bit
+- **Data to dump:** **256 KB** of external battery-backed SRAM — two **NEC μPD431000A-70LL**
+  devices (128K×8, 1 Mbit, 70 ns, low-standby "LL" data-retention grade) forming a 128K×16
+  bus (hence the byte order: even addresses in one device, odd in the other). These are
+  **ordinary SRAM**, not internal-battery nvSRAM; retention comes from an external cell (BT1)
+  through a backup-power switch, and the board's Dallas part (DS1286) is **RTC-only**. On
+  chip-select **CS0**, occupying **`$F80000–$FBFFFF`** in the CPU's 24-bit
   address space. (CPU16 forms 24-bit addresses as {K-register[3:0], 20-bit operand}; the
   bank nibble comes from EK/XK/YK/ZK depending on the addressing mode. Determine and verify
   the exact register/offset to read this range against the target.)
@@ -37,6 +41,17 @@ nothing to the vendor's firmware.
     (COP watchdog / bus monitor — disable or service the COP so it doesn't reset you),
     chip-select pin assignment/base/option registers `$FFA44`+ (only needed if CS0 must be
     programmed to see the SRAM on real hardware).
+    - **Clock:** out of reset the synthesizer runs at `f_ref·4·(Y+1)·2^(2W+X)` with
+      `SYNCR = $3F00` (Y=$3F, W=X=0) ⇒ `32768·4·64 = 8.39 MHz` — **half** the board's
+      16.78 MHz. The SCI baud divisor is computed for 16.78 MHz, so **program `SYNCR`**
+      (set X ⇒ `$7F00`, no VCO relock needed) or every baud comes out at half rate.
+- **External watchdog (board fact, from the rev E/C schematic):** besides the on-chip COP,
+  the board has a **DS1232 (U24)** hardware watchdog that pulls the CPU `/RESET` unless its
+  **`/ST` strobe is toggled** within the timeout (TD strapped to VCC ⇒ ~0.6–1.2 s). `/ST` is
+  wired to the CPU's **PQS1** pin (QSM `PORTQS` bit 1; schematic net "ST" → U16 pin 11 =
+  MOSI = PQS1). Disabling the COP (SYPCR) does **not** affect it. The multi-minute dump far
+  exceeds the timeout, so the firmware must make PQS1 a `PORTQS`/`DDRQS` output and pulse it
+  continuously — on every transmitted byte and inside every receive-wait spin.
   - **QSM** base `$FFC00`, containing the **SCI** (async UART):
     `SCCR0` `$FFC08` (baud rate register), `SCCR1` `$FFC0A` (enables: TE/RE, mode),
     `SCSR` `$FFC0C` (status: TDRE/RDRF/etc.), `SCDR` `$FFC0E` (data).
