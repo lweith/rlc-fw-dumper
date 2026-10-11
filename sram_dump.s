@@ -33,6 +33,20 @@
 ; SIM (base $FFA00):
 SYNCR   EQU     $FA04           ; Clock Synthesizer CR (word)  -> set f_sys
 SYPCR   EQU     $FA21           ; System Protection CR (byte) -> disable COP
+CSPAR0  EQU     $FA44           ; Chip-select pin assignment 0 (word)
+CSBAR0  EQU     $FA4C           ; CS0 base address register (word)
+CSOR0   EQU     $FA4E           ; CS0 option register (word)
+;
+; CS0 frames the two SRAMs (U14/U15, one per byte lane) as one 16-bit port at
+; $F80000, 256 KB (board map).  Out of reset only CSBOOT is live, so without
+; this every SRAM access waits forever for a DSACK that never comes (and with
+; the bus monitor off, nothing breaks the wait: the DS1232 resets the board).
+CSP0_16 EQU     $000C           ; CSPAR0 bits 3:2 (CS0 field) = %11: 16-bit chip select
+CSB0VAL EQU     $F805           ; CSBAR0: base $F80000 (A23-A11 in 15:3), BLKSZ %101 = 256K
+; CSOR0: MODE=0 async | BYTE=%11 both | R/W=%11 both | STRB=0 AS |
+;        DSACK=%0010 (2 wait states; 70 ns parts, 60 ns clock) | SPACE=%11 S/U |
+;        IPL=0 | AVEC=0
+CSO0VAL EQU     $78B0
 ;
 ; QSM (base $FFC00) - Z points here at run time (Z = $FC00, ZK = $F):
 QSMBASE EQU     $FC00
@@ -99,12 +113,6 @@ CMD_X   EQU     $58             ; 'X' : read SYNCR (clock/SLOCK) -> hi,lo
 CMD_J   EQU     $4A             ; 'J' : jump hi,lo (bank-0 program space; experimental)
 CMD_S   EQU     $53             ; 'S' : boot slot index -> 1 byte ($FF = not slotted)
 ACKCHR  EQU     $4B             ; 'K' : write acknowledge
-; Scratch cell for assembling a 24-bit pointer from received bytes (CPU16 has
-; no D->X transfer, so the address bytes land here and LDX pulls the offset).
-; Placed in the firmware-idle SRAM gap so it never touches config; Y (YK=$F8)
-; points at it for the whole monitor session.
-SCRBNK  EQU     $F8             ; scratch bank (SRAM CS0)
-SCROFF  EQU     $E000           ; scratch offset -> $F8E000 (idle gap)
 
 ;-----------------------------------------------------------------------
 ; Slot build (boot_stub.s): `make patch SLOT=n` defines SLOTBASE (and SLOTSZ)
@@ -277,6 +285,18 @@ START:
 ; a divider outside the VCO loop, so no relock is needed and there is no wait.
         LDD     #$7F00          ; SYNCR: W=0 X=1 Y=$3F -> 16.78 MHz
         STD     SYNCR           ; (EK=$F -> $FFA04)
+
+; --- Chip select CS0 -> external SRAM ---------------------------------
+; Read-modify-write CSPAR0 so only the CS0 field changes: CSBOOT's field holds
+; the boot port width (8-bit for the 27C040) and must be left as reset set it.
+; Derived from the HC16Z1 SIM chip-select register layout + the board map.
+        LDD     CSPAR0
+        ORD     #CSP0_16
+        STD     CSPAR0          ; CS0 pin = 16-bit chip select
+        LDD     #CSB0VAL
+        STD     CSBAR0          ; $F80000, 256 KB
+        LDD     #CSO0VAL
+        STD     CSOR0           ; enable: both bytes, R/W, 2 wait states
 
 ; --- Bring up the SCI ------------------------------------------------
         LDD     #SCBRVAL
@@ -470,15 +490,28 @@ DONE:
 ;   'W' bank hi lo data      -> writes one byte, replies 'K'
 ;   'J' hi lo                -> JMP to bank-0 program address hi:lo (experimental)
 ;   'S'                      -> boot slot index, 1 byte ($FF = not slotted)
-; Multi-byte addresses are assembled through the SCROFF scratch cell (CPU16 has
-; no D->X transfer).  'V' and 'X' touch no RAM, so they answer even if external
-; SRAM is dead -- 'X' is the live clock probe (SYNCR; SLOCK = lo bit3).  Every
-; SENDB / RECVB feeds the DS1232.  Clean-room: CPU16 register map + SCI only.
+; The monitor uses NO RAM: addresses are assembled in registers (GETADR), so
+; R/W can probe module registers (e.g. the chip selects) even when external
+; SRAM does not respond.  'X' is the live clock probe (SYNCR; SLOCK = lo bit3).
+; Every SENDB / RECVB feeds the DS1232.  Clean-room: CPU16 register map + SCI.
 ;-----------------------------------------------------------------------
+; GETADR : receive addr hi, addr lo -> X = hi:lo.  XK untouched (set the bank
+;   before or after).  Clobbers D and Y.  Y parks the high byte across the
+;   second receive; ABX adds the low byte (hi:00 + lo never carries).
+GETADR  MACRO   l1,l2
+        RECVB   l1              ; B = hi
+        CLRA
+        XGDY                    ; Y = 00:hi
+        RECVB   l2              ; B = lo
+        XGDY                    ; D = 00:hi, Y = ??:lo
+        TBA
+        CLRB                    ; D = hi:00
+        XGDX                    ; X = hi:00
+        XGDY                    ; B = lo
+        ABX                     ; X = hi:lo
+        ENDM
+
 MONITOR:
-        LDAB    #SCRBNK
-        TBYK                    ; YK = $F8 : Y-indexed stores hit the SRAM scratch
-        LDY     #SCROFF         ; Y -> $F8E000 (firmware-idle gap)
 MONLOOP:
         RECVB   rmon            ; B = command byte
         CMPB    #CMD_V
@@ -519,18 +552,11 @@ MON_X:
         LBRA    MONLOOP
 
 MON_R:
-        RECVB   rr1
-        STAB    2,Y             ; [2] = bank
-        RECVB   rr2
-        STAB    0,Y             ; [0] = addr hi
-        RECVB   rr3
-        STAB    1,Y             ; [1] = addr lo
-        RECVB   rr4
-        STAB    3,Y             ; [3] = count (0 means 256)
-        LDAB    2,Y
+        RECVB   rr1             ; B = bank
         TBXK                    ; XK = bank
-        LDX     0,Y             ; X = hi:lo
-        LDAA    3,Y             ; A = count (survives SENDB)
+        GETADR  rr2,rr3         ; X = hi:lo
+        RECVB   rr4             ; B = count (0 means 256)
+        TBA                     ; A = count (survives SENDB)
 MONRLP:
         LDAB    0,X             ; read one byte at XK:X
         SENDB                   ; send it
@@ -540,18 +566,10 @@ MONRLP:
         LBRA    MONLOOP
 
 MON_W:
-        RECVB   rw1
-        STAB    2,Y             ; bank
-        RECVB   rw2
-        STAB    0,Y             ; addr hi
-        RECVB   rw3
-        STAB    1,Y             ; addr lo
-        RECVB   rw4
-        STAB    3,Y             ; data
-        LDAB    2,Y
+        RECVB   rw1             ; B = bank
         TBXK                    ; XK = bank
-        LDX     0,Y             ; X = hi:lo
-        LDAB    3,Y             ; data
+        GETADR  rw2,rw3         ; X = hi:lo
+        RECVB   rw4             ; B = data
         STAB    0,X             ; write XK:X = data
         LDAB    #ACKCHR
         SENDB                   ; 'K'
@@ -563,12 +581,10 @@ MON_S:
         LBRA    MONLOOP
 
 MON_J:
-        RECVB   rj1
-        STAB    0,Y             ; addr hi
-        RECVB   rj2
-        STAB    1,Y             ; addr lo
-        LDX     0,Y             ; X = hi:lo
-        JMP     0,X             ; jump within current program bank (PK=0)
+        CLRB
+        TBXK                    ; XK = 0 : JMP ind20 takes its bank from XK
+        GETADR  rj1,rj2         ; X = hi:lo
+        JMP     0,X             ; jump to bank-0 program address hi:lo
 
 ;-----------------------------------------------------------------------
 ; Copyright / license string embedded in the image (data only -- never
