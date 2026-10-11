@@ -22,8 +22,54 @@ then `p2bin sram_dump.p sram_dump.bin -l 0xff -r 0x0-0x7ffff`. The `-r` spans
 the full 512 KB boot window and `-l 0xff` fills every unused cell with **`$FF`**
 (the erased-EPROM/flash state), so a programmer skips the blank cells and burns
 only the ~600 used bytes. No `truncate`; the image is exactly **524288 bytes**,
-reset vector at offset 0, code at `$0200`, banner at `$1000`, `$FF` everywhere
-else. Result: **0 errors, 0 warnings.**
+reset vector at offset 0, code at `$0200`, banner right after the code, `$FF`
+everywhere else. Result: **0 errors, 0 warnings.**
+
+## Append-only boot ROM (slots) — reburn without erasing
+
+Programming only clears bits (1→0), so a blank (`$FF`) region of an
+already-burned chip can be filled in later. `boot_stub.s` exploits that:
+
+- The 512 KB is split into `SLOTSZ` slots (default **16 KB → 31 usable**).
+  **Slot 0** is the stub: reset vector plus a scanner, burned **once**.
+  `SLOTSZ` is fixed for the life of the chip from then on.
+- Each slot `n ≥ 1` holds a complete dumper assembled to run at `n·SLOTSZ`,
+  starting with the header word `$C057`; the entry point is slot+2 (CPU16
+  code must be word-aligned).
+- The stub scans from the top slot down and jumps to the first whose header
+  byte is neither `$FF` (blank) nor `$00` (**revoked**) — i.e. the last one
+  burned. To back out a bad image, program its first byte to `$00` and the
+  stub falls back to the previous slot. No live slot → it spins silently.
+- The stub writes no configuration registers (SYPCR is write-once and belongs
+  to the image); its scan takes microseconds, inside both watchdog windows.
+- Handoff: `Y` = the chosen slot index. The image prints `boot: slot NN`
+  before the banner, adds `SLOT MISMATCH, built for MM` if that differs from
+  the slot it was assembled for, and answers monitor command `S` with the
+  index (`$FF` for a standalone build).
+
+```
+make patch SLOT=1                        # first burn: stub + slot 1 -> rom_patch.bin
+minipro -p DEV -r rom_now.bin            # later: read the chip back
+make patch SLOT=2 BASE=rom_now.bin       # overlay the next slot onto the readback
+minipro -p DEV -w rom_patch.bin          # flash parts: ADD -e, or minipro erases it
+```
+
+`rom_patch.py` overlays the stub and the slot onto `BASE` and **refuses** if
+any byte would need a 0→1 change (occupied slot, different stub/`SLOTSZ`, wrong
+base). Because the output equals the chip everywhere outside the new slot, the
+normal full-chip write + verify passes. It reports which slot the stub will
+boot.
+
+**Gotcha found in emulation:** CPU16 index registers are **20 bits** (XK:IX).
+`AIX` carries/borrows into XK, so the stub steps slots with a single
+`AIX #-SLOTSZ` and no bank arithmetic; an explicit bank decrement on top of
+that skipped a bank (the slot-index self-check is what caught it).
+
+Verified in MAME: slots 1–31 across every bank boundary report the right
+index; append chain 1→2→9, revocation fallback, refusal of an occupied slot,
+stub-only silence, monitor `S`/`V`, and a full 256 KB dump from slot 2
+(0 mismatches). Not yet verified on silicon: that CSBOOT's reset decode spans
+all 512 KB (if it does not, high slots read as garbage).
 
 ## Reset / vector layout
 

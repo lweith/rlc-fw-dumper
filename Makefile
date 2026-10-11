@@ -12,6 +12,15 @@
 #   make clean
 #   make clean all           force a full rebuild
 #
+# Append-only boot ROM (boot_stub.s): slot 0 = a stub that boots the LAST live
+# slot; images are appended into blank slots without erasing the chip.
+#   make patch SLOT=1                        first burn: stub + slot 1 on a blank image
+#   minipro -p DEV -r rom_now.bin            later: read the chip back, then
+#   make patch SLOT=2 BASE=rom_now.bin       overlay slot 2 -> rom_patch.bin
+#   make stub                                just the stub (boot_stub.bin)
+# The patch is refused if any byte would need a 0->1 change. It prints the
+# minipro command; set DEV= to your part (e.g. DEV=AM27C040).
+#
 # The BANNER file is embedded verbatim into the image; the firmware prints it
 # over the SCI before the XMODEM transfer. Edit header.txt (or point BANNER= at
 # any file) and re-run make -- no source edit needed.
@@ -42,9 +51,41 @@ FILL    := 0xff
 # STAGE = fixed name the source BINCLUDEs
 STAGE   := banner.bin
 
-.PHONY: all clean
+# SLOTSZ = bytes per boot-ROM slot. FIXED for the life of a chip once its stub
+#          is burned: every later slot build must use the same value.
+SLOTSZ  ?= 16384
+# SLOT = slot index for `make patch` (1 .. 512K/SLOTSZ-1; slot 0 is the stub)
+SLOT    ?=
+# BASE = image to overlay onto: a readback of the chip, or - for blank ($FF)
+BASE    ?= -
+# PATCH = output image for `make patch`
+PATCH   ?= rom_patch.bin
+# DEV = minipro device name, only used to print the burn command
+DEV     ?= <DEV>
+STUB    := boot_stub
+SLOTB    = $(shell echo $$(( $(SLOT) * $(SLOTSZ) )))
+SLOTE    = $(shell echo $$(( $(SLOT) * $(SLOTSZ) + $(SLOTSZ) - 1 )))
+
+.PHONY: all clean stub patch
 
 all: $(OUT)
+
+# Slot 0 only, assembled for SLOTSZ; boot_stub.bin is the full 512 KB view.
+stub: $(STUB).s
+	$(ASL) -cpu $(CPU) -D SLOTSZ=$(SLOTSZ) -L $(STUB).s
+	$(P2BIN) $(STUB).p $(STUB)_raw.bin -l $(FILL) -r 0x0-$$(( $(SLOTSZ) - 1 ))
+	$(P2BIN) $(STUB).p $(STUB).bin -l $(FILL) -r 0x0-$(IMGTOP)
+
+# Dumper assembled to run from slot SLOT, overlaid with the stub onto BASE.
+patch: stub $(SRC) $(BANNER)
+	@test -n "$(SLOT)" || { echo "usage: make patch SLOT=n [BASE=readback.bin]"; exit 1; }
+	sed 's/@BAUD@/$(BAUD)/g' "$(BANNER)" > $(STAGE)
+	$(ASL) -cpu $(CPU) -D SCBRVAL=$(SCBR) -D SLOTSZ=$(SLOTSZ) -D SLOTBASE=$(SLOTB) \
+		-o slot$(SLOT).p -olist slot$(SLOT).lst -L $(SRC)
+	$(P2BIN) slot$(SLOT).p slot$(SLOT)_raw.bin -l $(FILL) -r $(SLOTB)-$(SLOTE)
+	python3 -I rom_patch.py --base "$(BASE)" --out $(PATCH) --slotsz $(SLOTSZ) \
+		0:$(STUB)_raw.bin $(SLOTB):slot$(SLOT)_raw.bin
+	@echo "burn:   minipro -p $(DEV) -w $(PATCH)    (add -e if the part is FLASH: no erase!)"
 
 # Rebuild whenever the source OR the chosen banner file changes.
 $(OUT): $(SRC) $(BANNER)
@@ -55,4 +96,5 @@ $(OUT): $(SRC) $(BANNER)
 	@ls -l $(OUT)
 
 clean:
-	rm -f $(OUT) $(STAGE) $(STEM).p $(STEM).lst
+	rm -f $(OUT) $(STAGE) $(STEM).p $(STEM).lst $(STUB).p $(STUB).lst $(STUB).bin \
+		$(STUB)_raw.bin slot*.p slot*.lst slot*_raw.bin $(PATCH)

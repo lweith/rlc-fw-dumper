@@ -68,8 +68,9 @@ BANKEND EQU     $0C             ; nibble after last SRAM bank ($B) -> done
 ;
 ; E accumulator packs bank tracker (high byte) and XMODEM block number
 ; (low byte).  The bank is tracked in an accumulator and only ever WRITTEN
-; to XK; XK is never read back (a read-modify-write of the extension
-; register does not round-trip as +1 on this target).
+; to XK; XK is never read back.  (IX is 20 bits: the data loop's AIX #1 at
+; $FFFF already carries into XK, so a read-modify-write +1 of XK there would
+; overshoot by a bank.  Writing the tracked value is right either way.)
 EINIT   EQU     (SRAMBNK*256)+1 ; E high = first bank, E low = block# 1
 ;
 ; XMODEM control bytes:
@@ -96,6 +97,7 @@ CMD_R   EQU     $52             ; 'R' : read  bank,hi,lo,count -> count bytes
 CMD_W   EQU     $57             ; 'W' : write bank,hi,lo,data  -> 'K'
 CMD_X   EQU     $58             ; 'X' : read SYNCR (clock/SLOCK) -> hi,lo
 CMD_J   EQU     $4A             ; 'J' : jump hi,lo (bank-0 program space; experimental)
+CMD_S   EQU     $53             ; 'S' : boot slot index -> 1 byte ($FF = not slotted)
 ACKCHR  EQU     $4B             ; 'K' : write acknowledge
 ; Scratch cell for assembling a 24-bit pointer from received bytes (CPU16 has
 ; no D->X transfer, so the address bytes land here and LDX pulls the offset).
@@ -103,6 +105,61 @@ ACKCHR  EQU     $4B             ; 'K' : write acknowledge
 ; points at it for the whole monitor session.
 SCRBNK  EQU     $F8             ; scratch bank (SRAM CS0)
 SCROFF  EQU     $E000           ; scratch offset -> $F8E000 (idle gap)
+
+;-----------------------------------------------------------------------
+; Slot build (boot_stub.s): `make patch SLOT=n` defines SLOTBASE (and SLOTSZ)
+; and this image is assembled to run from slot n of the boot ROM instead of
+; owning the reset vector.  The stub enters at SLOTBASE+2 with Y = the slot
+; index it chose; the image prints it and flags a mismatch with SLOTNUM.
+        IFDEF   SLOTBASE
+SLOTNUM EQU     SLOTBASE/SLOTSZ
+SLOTMAG EQU     $C057           ; live-slot header word (first byte not $FF/$00)
+        IF      (SLOTBASE & (SLOTSZ-1)) <> 0
+        ERROR   "SLOTBASE not slot-aligned"
+        ENDIF
+        IF      (SLOTNUM < 1) || (SLOTBASE >= $80000)
+        ERROR   "slot out of range (slot 0 is the stub)"
+        ENDIF
+        ENDIF
+
+;-----------------------------------------------------------------------
+; HEXDIG : B = nibble (0-15) -> send as an ASCII hex digit.  Preserves A.
+; HEX2   : B = byte -> send as two hex digits.  Clobbers A and B.
+; PUTS   : send n bytes from string s (Y-indexed; YK must hold s's bank).
+;   Labels are caller-supplied (asl has no one-liner for macro-local labels).
+;-----------------------------------------------------------------------
+HEXDIG  MACRO   l
+        ADDB    #$30            ; '0'
+        CMPB    #$3A            ; past '9'?
+        BLO     l
+        ADDB    #7              ; -> 'A'..'F'
+l:      SENDB
+        ENDM
+
+HEX2    MACRO   l1,l2
+        TBA                     ; A = byte (SENDB preserves A)
+        LSRB
+        LSRB
+        LSRB
+        LSRB
+        HEXDIG  l1              ; high nibble
+        TAB
+        ANDB    #$0F
+        HEXDIG  l2              ; low nibble
+        ENDM
+
+PUTS    MACRO   s,n,lp,dn
+        LDY     #(s&$FFFF)
+        LDX     #n
+lp:     CPX     #0
+        BEQ     dn
+        LDAB    0,Y
+        SENDB
+        AIY     #1
+        AIX     #-1
+        BRA     lp
+dn:
+        ENDM
 
 ;-----------------------------------------------------------------------
 ; STROBE : pulse PQS1 (high->low) to service the EXTERNAL DS1232 watchdog
@@ -155,7 +212,16 @@ lbl:    STROBE                          ; feed the watchdog while waiting
 ;   word1 = initial PC
 ;   word2 = initial SP        (unused: no stack ops / interrupts masked)
 ;   word3 = initial IZ
+; In a slot build the stub owns the reset vector; the slot starts with its
+; header word and the entry point follows it.
 ;***********************************************************************
+        IFDEF   SLOTBASE
+        ORG     SLOTBASE
+        DC.W    SLOTMAG         ; live-slot header
+START:
+        XGDY                    ; D <- slot index handed over by the stub in Y
+        TDE                     ; park it in E (untouched until DODUMP)
+        ELSE
         ORG     $000000
         DC.W    $0000           ; ZK/SK/PK = 0
         DC.W    START           ; initial PC
@@ -167,6 +233,8 @@ lbl:    STROBE                          ; feed the watchdog while waiting
 ;***********************************************************************
         ORG     $000200
 START:
+        LDE     #$00FF          ; E low = $FF : not started from a slot
+        ENDIF
         ORP     #$00E0          ; CCR: set interrupt priority mask IP=7
                                 ; (interrupts off; also reset default)
 
@@ -216,18 +284,42 @@ START:
         LDD     #TE_RE
         STD     SCCR1,Z         ; enable TX + RX, 8 data bits, no parity, 1 stop
 
+; All strings (slot line, banner, done message) live in this image's bank.
+        LDAB    #((banner>>16)&$F)
+        TBYK                    ; YK = this image's bank
+
+        IFDEF   SLOTBASE
+;-----------------------------------------------------------------------
+; Report the slot the stub started us from (E low), and flag it if that is
+; not the slot this image was assembled for -- a stub/layout bug, a wrong
+; patch BASE, or a slot that should have been revoked.
+;-----------------------------------------------------------------------
+        PUTS    slotmsg,SLOTMSG_LEN,psl1,psl2
+        TED
+        HEX2    hx1,hx2
+        TED
+        CMPB    #SLOTNUM
+        BEQ     SLOTOK
+        PUTS    mismsg,MISMSG_LEN,pms1,pms2
+        LDAB    #SLOTNUM
+        HEX2    hx3,hx4
+SLOTOK:
+        LDAB    #CR
+        SENDB
+        LDAB    #LF
+        SENDB
+        ENDIF
+
 ;-----------------------------------------------------------------------
 ; [main-session addition] Print the build-time-embedded banner (banner.bin).
 ;   Byte-transparent: drop CR ($0D), expand LF ($0A) -> CR,LF, and emit every
 ;   other byte verbatim -- so an arbitrary file (plain text OR ANSI/VT100 escape
-;   sequences) displays correctly.  Reads the banner from bank 0 via Y (YK=0);
+;   sequences) displays correctly.  Reads the banner via YK:Y (image bank);
 ;   X is used only as a byte counter (never dereferenced, so the SRAM bank in
 ;   XK is irrelevant here).  Cosmetic only: does not touch the clean-room
 ;   init/banking/XMODEM core below.
 ;-----------------------------------------------------------------------
-        CLRB
-        TBYK                    ; YK = 0 : Y-indexed reads hit bank 0 (banner ROM)
-        LDY     #banner
+        LDY     #(banner&$FFFF) ; YK = image bank (set above)
         LDX     #BANNER_LEN     ; X = bytes remaining (counter only)
 PRBAN:
         CPX     #0
@@ -353,9 +445,9 @@ SENDEOT:
 ;-----------------------------------------------------------------------
 ; [main-session addition] Print a fixed completion line, then halt.
 ;   donemsg carries explicit CRLF, so it is sent verbatim (no translation).
-;   Y = pointer (YK=0 from the banner setup), X = byte counter.
+;   Y = pointer (YK = image bank from the banner setup), X = byte counter.
 ;-----------------------------------------------------------------------
-        LDY     #donemsg
+        LDY     #(donemsg&$FFFF)
         LDX     #DONEMSG_LEN
 PRDON:
         CPX     #0
@@ -377,6 +469,7 @@ DONE:
 ;   'R' bank hi lo count     -> <count> bytes from bank:hi:lo (count 0 => 256)
 ;   'W' bank hi lo data      -> writes one byte, replies 'K'
 ;   'J' hi lo                -> JMP to bank-0 program address hi:lo (experimental)
+;   'S'                      -> boot slot index, 1 byte ($FF = not slotted)
 ; Multi-byte addresses are assembled through the SCROFF scratch cell (CPU16 has
 ; no D->X transfer).  'V' and 'X' touch no RAM, so they answer even if external
 ; SRAM is dead -- 'X' is the live clock probe (SYNCR; SLOCK = lo bit3).  Every
@@ -398,6 +491,8 @@ MONLOOP:
         LBEQ    MON_W
         CMPB    #CMD_J
         LBEQ    MON_J
+        CMPB    #CMD_S
+        LBEQ    MON_S
         BRA     MONLOOP         ; unknown command -> ignore, resync
 
 MON_V:
@@ -462,6 +557,11 @@ MON_W:
         SENDB                   ; 'K'
         LBRA    MONLOOP
 
+MON_S:
+        TED                     ; B = slot index (E is untouched on this path)
+        SENDB
+        LBRA    MONLOOP
+
 MON_J:
         RECVB   rj1
         STAB    0,Y             ; addr hi
@@ -485,16 +585,32 @@ donemsg:
 donemsg_end:
 DONEMSG_LEN     EQU     donemsg_end-donemsg
 
+        IFDEF   SLOTBASE
+slotmsg:
+        DC.B    "boot: slot "
+slotmsg_end:
+SLOTMSG_LEN     EQU     slotmsg_end-slotmsg
+mismsg:
+        DC.B    "  SLOT MISMATCH, built for "
+mismsg_end:
+MISMSG_LEN      EQU     mismsg_end-mismsg
+        ENDIF
+
 ;-----------------------------------------------------------------------
 ; Build-time-embedded banner: an arbitrary file staged as banner.bin (the
-; Makefile / build.sh copies BANNER -> banner.bin).  Printed byte-transparently
-; at startup (see PRBAN).  Placed clear of the code so any reasonable size fits
-; the image budget; length is computed at assemble time.
+; Makefile copies BANNER -> banner.bin).  Printed byte-transparently at
+; startup (see PRBAN).  Follows the code directly, so it lands in the same
+; slot and bank; length is computed at assemble time.
 ;-----------------------------------------------------------------------
-        ORG     $001000
 banner:
         BINCLUDE "banner.bin"
 banner_end:
 BANNER_LEN      EQU     banner_end-banner
+
+        IFDEF   SLOTBASE
+        IF      banner_end > SLOTBASE+SLOTSZ
+        ERROR   "image overflows its slot (raise SLOTSZ or shrink the banner)"
+        ENDIF
+        ENDIF
 
         END
