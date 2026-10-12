@@ -15,7 +15,13 @@ make BAUD=9600        # 9600 (stock default); BAUD=57600 for the fast build
 make BANNER=moo.txt   # embed a different banner/data file (see additions)
 make OUT=recover.bin  # name the output image
 make clean all        # force a full rebuild
+make patch SLOT=n     # append-only slot build (see "Append-only boot ROM")
+make bovine FW=host.bin  # graft onto a host firmware (see "Bovine bootloader")
 ```
+
+The `patch` and `bovine` targets use `rlcpatch`, a small C image-surgery helper
+the Makefile compiles with `cc` from `rlcpatch.c` — there is **no Python** build
+dependency (it replaced the earlier `rom_patch.py`/`bovine_patch.py`).
 
 It runs: `asl -cpu 68HC16 [-D SCBRVAL=n] -L sram_dump.s` → `sram_dump.p`,
 then `p2bin sram_dump.p sram_dump.bin -l 0xff -r 0x0-0x7ffff`. The `-r` spans
@@ -133,10 +139,18 @@ datasheet-only (no host code consulted); it reaches the host purely through the
 architected reset vector, so the hand-off owes nothing to the host's internals:
 
 - **SYPCR is never written on the chain path** — it is write-once and belongs
-  to the host, so the host's own write still takes. The cow keeps the on-chip
-  COP alive during the wait by servicing `SWSR`, and the external DS1232 by
-  strobing PQS1; the final strobe gives the host a full watchdog window, the
-  same as a cold boot.
+  to the host, so the host's own write still takes. That has a consequence: the
+  cow cannot disable the on-chip COP watchdog the way the standalone/slot dumper
+  does (which writes `SYPCR=$00` first thing), so it must **feed both watchdogs
+  for the whole time it runs**, not just in the wait. In the bovine build the
+  `STROBE` macro services the external DS1232 (pulse PQS1) *and* the COP (write
+  `SWSR` `$55`,`$AA`), and it runs on every byte sent and every wait-loop pass.
+  The COP resets to a ~15.6 ms time-out (SWP=1 from MODCLK); the first bovine
+  build serviced the COP only inside the wait loop, so the ~22 ms banner print
+  starved it and the board reset mid-banner — a boot loop (fixed in 1.2.1). Once
+  the window elapses the final strobe gives the host a full watchdog window, the
+  same as a cold boot; on the escape path the cow writes `SYPCR=$00` itself (it
+  will never chain back) and the COP service becomes a harmless no-op.
 - `rlcpatch bovine` reads the host's reset vector, grafts the cow, and writes a
   new vector whose **PK nibble = the cow's bank** (so it runs in place) while
   keeping the host's SP/IZ in words 2/3. The host entry PC and IZ are baked
@@ -149,7 +163,9 @@ vector needs 0→1 changes, so a UV part must be erased first.
 
 Verified in MAME against `ClubDlx2-v2.16`: the window elapsing boots stock
 `V2.16dlx2` cleanly to `DTMF>`, and a keypress drops into the monitor
-(`V` → `COW1`).
+(`V` → `COW1`). The boot loop above is reproduced too — the COP is now modelled
+in the emulator (see below), so an unfed-watchdog build fails in MAME instead of
+only on silicon.
 
 ## Reset / vector layout
 
@@ -184,8 +200,14 @@ There are **two** watchdogs on this board; both must be handled.
 
 **On-chip COP.** `SYPCR` (`$FFA21`) bit7 `SWE` = 0 disables the software
 watchdog; writing `$00` also clears the bus/halt monitors. Done once, as the
-**first** SIM write (`CLRA; STAA $FA21`): the COP is enabled out of reset with a
-short timeout, so nothing slow may run ahead of it.
+**first** SIM write (`CLRA; STAA $FA21`): the COP is enabled out of reset, so
+nothing slow may run ahead of it. The reset-default time-out is ~15.6 ms on this
+board (`SWE=1, SWP=1` from MODCLK, `SWT=00` → 2¹⁸ system clocks); `SYPCR` is
+write-once, so the first write wins. The standalone/slot dumper disables it
+immediately; the **bovine** build can't (that write belongs to the host) and
+instead services it continuously via `SWSR` — see the bovine section. The COP is
+now modelled in MAME (previously only the external DS1232 was), so a build that
+out-runs it reset-loops in the emulator too.
 
 **External DS1232 (U24).** `SYPCR` does **not** touch this hardware part — it
 pulls `/RESET` unless its `/ST` strobe is toggled within ~0.6–1.2 s (TD=VCC).
@@ -381,6 +403,12 @@ config. It is also why an on-device hash (MD5 / CRC-32 / sum-32) is impractical
   `PORTQS` strobes/s) and completes the full 2048-block dump with 0 mismatches.
   The earlier "verified" runs predated the emulated watchdog and would have
   reset-looped on real hardware — the reason the watchdog + `SYNCR` fixes exist.
+- **With the on-chip COP now modelled in MAME too** (SYPCR write-once, SWE/SWP/
+  SWT time-out, `SWSR` `$55`/`$AA` service, time-out → reset): a bovine build
+  that fed the COP only in its wait loop reset-loops mid-banner in the emulator,
+  exactly as it did on silicon (~31 chars before each reset ≈ the real ~15 ms);
+  the fixed build that services the COP per byte boots the host and reaches the
+  monitor. This is the bug class that used to be invisible until a chip burn.
 - Banner prints correctly: cow + 12 CRLF pairs (12 LF / 12 CR, no lone LFs).
 - End-to-end run: banner → 2048/2048 blocks → `Done.` → 0 mismatches.
 - Baud is irrelevant over MAME's socket (byte-oriented); `SCBRVAL` matters only
