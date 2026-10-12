@@ -249,17 +249,21 @@ lbl:    STROBE                          ; feed the watchdog while waiting
 ;***********************************************************************
         IFDEF   BOVINE
 ;***********************************************************************
-; Bovine build: this image is relocated into a host firmware's free space
-; at BOVBASE.  The first four words are VEC_SAVE -- bovine_patch.py fills
-; them with the host's ORIGINAL reset vector so CHAIN can hand control back.
-; START follows immediately, so the patcher knows the entry is BOVBASE+8.
+; Bovine build: this image is relocated into a host firmware's free $FF space
+; at BOVBASE (entry = BOVBASE; the patcher points the reset vector here and
+; sets the vector's PK nibble to this image's bank so START runs in it).  The
+; CPU loads SP/IZ from the patcher-written vector = the host's originals, so
+; CHAIN needs no runtime copy of the host vector; it only restores the one
+; host register the cow clobbers (IZ) and JMPs to the host entry.  HOSTPC and
+; HOSTIZ are build-time constants the Makefile reads out of the host image.
 ;***********************************************************************
+        IFNDEF  HOSTPC
+HOSTPC  EQU     $0400           ; host reset PC (default: RLC-Club at $0400)
+        ENDIF
+        IFNDEF  HOSTIZ
+HOSTIZ  EQU     $0000           ; host reset IZ (vector word3)
+        ENDIF
         ORG     BOVBASE
-VEC_SAVE:
-        DC.W    $0000           ; host word0 (ZK:SK:PK)  -- patcher-filled
-        DC.W    $0000           ; host word1 (PC)        -- patcher-filled
-        DC.W    $0000           ; host word2 (SP)        -- patcher-filled
-        DC.W    $0000           ; host word3 (IZ)        -- patcher-filled
 START:
         LDE     #$00FF          ; E low = $FF : not started from a slot
         ELSE
@@ -373,9 +377,9 @@ START:
 BOVWT:
         STROBE                          ; feed the external DS1232
         LDAB    #COP_A
-        STAB    SWSR,Z...
+        STAB    SWSR                    ; COP service byte 1 ($FFA27, EK=$F)
         LDAB    #COP_B
-        STAB    SWSR,Z...
+        STAB    SWSR                    ; COP service byte 2 -> COP timer reset
         BRSET   SCSR_LO,Z,#RDRF,BOVESC  ; a byte arrived -> escape to the dumper
         LDX     #$FFFF                  ; inner delay spin
 BOVIN:
@@ -683,6 +687,35 @@ MON_J:
         GETADR  rj1,rj2         ; X = hi:lo
         JMP     0,X             ; jump to bank-0 program address hi:lo
 
+        IFDEF   BOVINE
+;-----------------------------------------------------------------------
+; CHAIN : the escape window elapsed -- hand control to the host firmware.
+; The host reinitializes every peripheral at its own reset, so we only need to
+; put the CPU back into the state a hardware reset leaves and JMP to the host
+; entry.  SP and SK are untouched by the cow (it uses no stack), so they still
+; hold the host's reset values that the CPU loaded from the patcher-written
+; vector.  IZ is the one host register the cow overwrote (LDZ #QSMBASE), so it
+; is restored from HOSTIZ.  EK/ZK/XK/YK are returned to 0 (the reset value the
+; host's own startup expects).  SYPCR was never written here, so the host's
+; write-once programming still takes; and the DS1232 was just strobed, so the
+; host gets a full watchdog window -- the same as a cold boot.  A bank-0 host
+; entry is assumed (JMP via XK=0); bovine_patch.py verifies the host vector's
+; PK nibble is 0 before it builds the image.
+;-----------------------------------------------------------------------
+CHAIN:
+        LDD     #$0000
+        STD     SCCR1,Z         ; SCI TE/RE off (needs ZK=$F/Z=QSM -- still set)
+        CLRB
+        TBEK                    ; EK = 0  (host reset value)
+        TBZK                    ; ZK = 0
+        TBYK                    ; YK = 0
+        LDZ     #HOSTIZ         ; IZ <- host word3 (cow had clobbered Z)
+        CLRB
+        TBXK                    ; XK = 0  (host program bank)
+        LDX     #HOSTPC         ; X = host reset entry PC
+        JMP     0,X             ; PK:PC <- 0:HOSTPC -- enter the host firmware
+        ENDIF
+
 ;-----------------------------------------------------------------------
 ; Copyright / license string embedded in the image (data only -- never
 ; executed or printed; discoverable via `strings sram_dump.bin`).
@@ -707,6 +740,19 @@ mismsg:
         DC.B    "  SLOT MISMATCH, built for "
 mismsg_end:
 MISMSG_LEN      EQU     mismsg_end-mismsg
+        ENDIF
+
+        IFDEF   BOVINE
+;-----------------------------------------------------------------------
+; Bovine prompt: printed once before the escape window opens.  Kept short
+; (the full file banner is skipped on this path).  @BAUD@ is NOT substituted
+; here -- this is a source literal, not the staged banner file.
+;-----------------------------------------------------------------------
+bovmsg:
+        DC.B    $0D,$0A,"MOO! bovine boot. Press any key for dumper/monitor, "
+        DC.B    "else booting host...",$0D,$0A
+bovmsg_end:
+BOVMSG_LEN      EQU     bovmsg_end-bovmsg
         ENDIF
 
 ;-----------------------------------------------------------------------

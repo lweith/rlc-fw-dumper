@@ -2,3 +2,5 @@
 *.bin
 *.p
 *.lst
+# Compiled image-surgery helper (source rlcpatch.c is tracked)
+/rlcpatch

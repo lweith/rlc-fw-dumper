@@ -54,8 +54,9 @@ make patch SLOT=2 BASE=rom_now.bin       # overlay the next slot onto the readba
 minipro -p DEV -w rom_patch.bin          # flash parts: ADD -e, or minipro erases it
 ```
 
-`rom_patch.py` overlays the stub and the slot onto `BASE` and **refuses** if
-any byte would need a 0→1 change (occupied slot, different stub/`SLOTSZ`, wrong
+`rlcpatch overlay` (built from `rlcpatch.c` by the Makefile — a small C helper,
+no Python) overlays the stub and the slot onto `BASE` and **refuses** if any
+byte would need a 0→1 change (occupied slot, different stub/`SLOTSZ`, wrong
 base). Because the output equals the chip everywhere outside the new slot, the
 normal full-chip write + verify passes. It reports which slot the stub will
 boot.
@@ -70,6 +71,48 @@ index; append chain 1→2→9, revocation fallback, refusal of an occupied slot,
 stub-only silence, monitor `S`/`V`, and a full 256 KB dump from slot 2
 (0 mismatches). Not yet verified on silicon: that CSBOOT's reset decode spans
 all 512 KB (if it does not, high slots read as garbage).
+
+## Bovine bootloader — graft onto a host firmware
+
+The slot scheme owns the reset vector. The **bovine** build instead rides
+inside a complete, unrelated **host** firmware image: it is relocated (via the
+same `-D` hook as a slot, here `-D BOVBASE`) into a run of blank `$FF` in the
+host, and the reset vector is redirected to it. On boot the cow prints a
+one-line prompt and opens a ~5 s window:
+
+- **a key arrives** → it finishes bring-up (SYPCR, CS0) and enters the normal
+  dumper / monitor;
+- **the window elapses** → it restores a reset CPU state and jumps to the
+  host's saved entry, which boots exactly as if the cow were not there.
+
+```
+make bovine FW=host.bin                  # graft cow into your image -> bovine.bin
+make bovine FW=host.bin BOVBASE=0x2D000  # choose where it lands in the $FF gap
+minipro -p DEV -w bovine.bin             # full image: ERASE + burn (not additive)
+```
+
+Bring your own `FW` (a minipro readback, or a vendor update image). The cow is
+datasheet-only (no host code consulted); it reaches the host purely through the
+architected reset vector, so the hand-off owes nothing to the host's internals:
+
+- **SYPCR is never written on the chain path** — it is write-once and belongs
+  to the host, so the host's own write still takes. The cow keeps the on-chip
+  COP alive during the wait by servicing `SWSR`, and the external DS1232 by
+  strobing PQS1; the final strobe gives the host a full watchdog window, the
+  same as a cold boot.
+- `rlcpatch bovine` reads the host's reset vector, grafts the cow, and writes a
+  new vector whose **PK nibble = the cow's bank** (so it runs in place) while
+  keeping the host's SP/IZ in words 2/3. The host entry PC and IZ are baked
+  into the cow as `HOSTPC`/`HOSTIZ` (read out of `FW` at build time). It refuses
+  a non-512 KB image, a non-bank-0 host entry, an unaligned base, a cow that
+  straddles a 64 KB bank, or a landing zone that is not all `$FF`.
+
+Unlike the slot scheme this is **not** an additive burn: redirecting the reset
+vector needs 0→1 changes, so a UV part must be erased first.
+
+Verified in MAME against `ClubDlx2-v2.16`: the window elapsing boots stock
+`V2.16dlx2` cleanly to `DTMF>`, and a keypress drops into the monitor
+(`V` → `COW1`).
 
 ## Reset / vector layout
 
