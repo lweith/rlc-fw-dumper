@@ -1,0 +1,90 @@
+name: CI
+
+# Build the firmware and the rlcpatch helper on every push/PR. No vendor
+# firmware is used anywhere: the bovine graft is exercised against a synthetic
+# all-$FF host with a hand-built bank-0 reset vector.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0      # tags, so version.sh resolves a real version
+
+      - name: Install the AS macroassembler (asl + p2bin)
+        run: sudo apt-get update && sudo apt-get install -y asl
+
+      - name: Tool versions
+        run: |
+          asl -version 2>&1 | head -1 || true
+          cc --version | head -1
+          gcc --version | head -1
+          clang --version | head -1 || sudo apt-get install -y clang
+
+      # rlcpatch must stay portable C89 with no warnings under both compilers.
+      - name: Build rlcpatch (gcc, -Werror)
+        run: |
+          make clean
+          make rlcpatch CC=gcc CFLAGS="-O2 -std=c89 -Wall -Wextra -Werror"
+          ./rlcpatch 2>&1 | head -1 || true
+
+      - name: Build rlcpatch (clang, -Werror)
+        run: |
+          rm -f rlcpatch
+          make rlcpatch CC=clang CFLAGS="-O2 -std=c89 -Wall -Wextra -Werror"
+
+      - name: Show the build version
+        run: sh ./version.sh
+
+      - name: Build the standalone dumper, stub, and a slot patch
+        run: |
+          make
+          test "$(stat -c%s sram_dump.bin)" -eq 524288
+          make stub
+          test "$(stat -c%s boot_stub.bin)" -eq 524288
+          make patch SLOT=1
+          test "$(stat -c%s rom_patch.bin)" -eq 524288
+
+      # Synthesize a host: 512 KB of $FF with a bank-0 reset vector
+      # (word0=$0000, PC=$0400, SP=$03FE, IZ=$0000). No vendor bytes.
+      - name: Synthesize a dummy host and graft the cow onto it
+        run: |
+          head -c 524288 /dev/zero | tr '\000' '\377' > host.bin
+          printf '\x00\x00\x04\x00\x03\xfe\x00\x00' | dd of=host.bin bs=1 conv=notrunc status=none
+          make bovine FW=host.bin
+          test "$(stat -c%s bovine.bin)" -eq 524288
+
+      - name: Check the grafted reset vector (PK=cow bank 2, PC=$D000)
+        run: |
+          vec=$(od -An -tx1 -N8 bovine.bin | tr -d ' \n')
+          echo "new reset vector = $vec"
+          # word0=0002 (PK=2), word1=d000 (BOVBASE&FFFF), word2=03fe (host SP)
+          test "$vec" = "0002d00003fe0000"
+
+      - name: rlcpatch assertions
+        run: |
+          # probe reads the host vector
+          test "$(./rlcpatch probe host.bin)" = "0x0400 0x0000 0x0"
+          # overlay from a blank image reports no live slots and writes 512 KB
+          ./rlcpatch overlay --base - --out /tmp/blank.bin --slotsz 16384 0:boot_stub_raw.bin
+          test "$(stat -c%s /tmp/blank.bin)" -eq 524288
+          # a wrong-size host is refused (nonzero exit)
+          head -c 1024 /dev/zero > small.bin
+          if ./rlcpatch bovine --fw small.bin --cow boot_stub_raw.bin --base 0x2D000 --out /tmp/x.bin; then
+            echo "ERROR: rlcpatch accepted a non-512 KB host" >&2; exit 1
+          fi
+
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-images
+          path: |
+            sram_dump.bin
+            boot_stub.bin
+            rom_patch.bin
+          if-no-files-found: error

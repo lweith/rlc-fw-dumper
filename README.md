@@ -1,5 +1,7 @@
 # sram_dump — design notes and derivation
 
+[![CI](https://github.com/lweith/rlc-fw-dumper/actions/workflows/ci.yml/badge.svg)](https://github.com/lweith/rlc-fw-dumper/actions/workflows/ci.yml)
+
 Read-only NVSRAM dumper for an MC68HC16Z1 (CPU16) board. Everything below is
 derived from the **MC68HC16Z1 / CPU16 datasheet & user's manual**, the public
 **XMODEM** protocol, and the facts in `HARDWARE_SPEC.md`. No vendor firmware,
