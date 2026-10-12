@@ -2,6 +2,17 @@
 
 Versions follow semver as described under "Versioning" in `README.md`.
 
+## 1.2.1
+
+- Bovine: keep the on-chip COP watchdog alive for the whole of the cow's run.
+  The COP is write-once-owned by the host, so the cow cannot disable it and must
+  service `SWSR` continuously. It previously serviced only inside the wait loop,
+  so the ~22 ms banner/ident print starved it and the board reset mid-banner (a
+  boot loop on real silicon). `STROBE` now also services the COP on every byte
+  sent, and the escape-window loop services on every iteration. The reset-default
+  COP time-out is ~15.6 ms (SWP=1 from MODCLK), observed on the board and now
+  modelled in the MAME harness so this class of bug is caught in emulation.
+
 ## 1.2.0
 
 - Bovine bootloader (`make bovine FW=host.bin`): graft the cow into a host

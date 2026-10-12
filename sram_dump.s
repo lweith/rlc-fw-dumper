@@ -118,8 +118,15 @@ BLKSZ   EQU     128             ; XMODEM data bytes per block
 ; service protocol, SCI) only; nothing from the host firmware.
 COP_A   EQU     $55             ; COP service sequence byte 1 (SWSR)
 COP_B   EQU     $AA             ; COP service sequence byte 2 (SWSR)
+; Escape window length = BOVWAIT * BOVINNER iterations of the wait loop, which
+; STROBEs (DS1232 + COP) once per iteration.  Defaults aim at ~5 s @ 16.78 MHz;
+; both are build knobs (raise/lower for a longer/shorter window).  Timing is a
+; busy-loop estimate, not timer-exact.
         IFNDEF  BOVWAIT
-BOVWAIT EQU     1300            ; outer wait passes (~5 s @ 16.78 MHz); build knob
+BOVWAIT EQU     85              ; outer passes
+        ENDIF
+        IFNDEF  BOVINNER
+BOVINNER EQU    $8000           ; inner iterations per outer pass (32768)
         ENDIF
 
 ;-----------------------------------------------------------------------
@@ -210,6 +217,18 @@ STROBE  MACRO
         STAB    PORTQS,Z
         LDAB    #$80                    ; PQS1 = 0  (edge resets the DS1232)
         STAB    PORTQS,Z
+        IFDEF   BOVINE
+; Bovine also services the on-chip COP here: unlike the standalone/slot builds
+; it never writes SYPCR (write-once -- the host's), so the COP stays enabled
+; from reset and must be fed throughout the cow's run (prints and waits), not
+; just in the wait loop, or it resets the board mid-banner (a boot loop).  Only
+; B is used, so A is still preserved for a checksum-bearing SENDB.  After the
+; escape path disables the COP this is a harmless no-op.
+        LDAB    #COP_A
+        STAB    SWSR                    ; COP service byte 1 ($FFA27, EK=$F)
+        LDAB    #COP_B
+        STAB    SWSR                    ; COP service byte 2 -> COP timer reset
+        ENDIF
         ENDM
 
 ;-----------------------------------------------------------------------
@@ -384,15 +403,14 @@ START:
 ;-----------------------------------------------------------------------
         PUTS    bovmsg,BOVMSG_LEN,pbv1,pbv2
         LDY     #BOVWAIT
+; Y = outer passes, X = inner spin.  STROBE (DS1232 + COP) and the RDRF poll run
+; on EVERY inner iteration, so neither watchdog can starve during the delay and
+; a keypress is caught promptly.  ~BOVWAIT*BOVINNER iterations total.
 BOVWT:
-        STROBE                          ; feed the external DS1232
-        LDAB    #COP_A
-        STAB    SWSR                    ; COP service byte 1 ($FFA27, EK=$F)
-        LDAB    #COP_B
-        STAB    SWSR                    ; COP service byte 2 -> COP timer reset
-        BRSET   SCSR_LO,Z,#RDRF,BOVESC  ; a byte arrived -> escape to the dumper
-        LDX     #$FFFF                  ; inner delay spin
+        LDX     #BOVINNER               ; inner spin count
 BOVIN:
+        STROBE                          ; feed DS1232 + COP every iteration
+        BRSET   SCSR_LO,Z,#RDRF,BOVESC  ; a byte arrived -> escape to the dumper
         AIX     #-1
         CPX     #0
         BNE     BOVIN
