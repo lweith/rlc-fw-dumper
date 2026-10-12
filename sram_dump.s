@@ -33,6 +33,7 @@
 ; SIM (base $FFA00):
 SYNCR   EQU     $FA04           ; Clock Synthesizer CR (word)  -> set f_sys
 SYPCR   EQU     $FA21           ; System Protection CR (byte) -> disable COP
+SWSR    EQU     $FA27           ; Software watchdog service reg (COP keep-alive)
 CSPAR0  EQU     $FA44           ; Chip-select pin assignment 0 (word)
 CSBAR0  EQU     $FA4C           ; CS0 base address register (word)
 CSOR0   EQU     $FA4E           ; CS0 option register (word)
@@ -100,6 +101,26 @@ CR      EQU     $0D             ; carriage return (banner line-end handling)
 LF      EQU     $0A             ; line feed
 ;
 BLKSZ   EQU     128             ; XMODEM data bytes per block
+
+;-----------------------------------------------------------------------
+; Bovine bootloader (`make bovine FW=host.bin`): a datasheet-only front-end
+; that RIDES in a host firmware's free space.  bovine_patch.py points the
+; reset vector at this image's START and copies the host's ORIGINAL four
+; reset-vector words into VEC_SAVE below.  On boot the cow brings up the SCI
+; (but NOT SYPCR -- write-once, left untouched for the host) and offers a
+; short escape window:
+;   any byte received within the window -> finish init, enter the dumper/monitor
+;   window elapses                       -> restore a reset CPU state, JMP to the
+;                                           host's saved vector (chain-load)
+; The on-chip COP is enabled out of reset and SYPCR is off-limits here, so the
+; wait keeps it alive by servicing SWSR ($55,$AA) every pass, alongside the
+; DS1232 PQS1 strobe.  Clean-room: CPU16 datasheet (reset-vector format, COP
+; service protocol, SCI) only; nothing from the host firmware.
+COP_A   EQU     $55             ; COP service sequence byte 1 (SWSR)
+COP_B   EQU     $AA             ; COP service sequence byte 2 (SWSR)
+        IFNDEF  BOVWAIT
+BOVWAIT EQU     1300            ; outer wait passes (~5 s @ 16.78 MHz); build knob
+        ENDIF
 
 ;-----------------------------------------------------------------------
 ; [main-session addition] Serial monitor ("cow monitor") selection + opcodes.
@@ -226,6 +247,22 @@ lbl:    STROBE                          ; feed the watchdog while waiting
 ; In a slot build the stub owns the reset vector; the slot starts with its
 ; header word and the entry point follows it.
 ;***********************************************************************
+        IFDEF   BOVINE
+;***********************************************************************
+; Bovine build: this image is relocated into a host firmware's free space
+; at BOVBASE.  The first four words are VEC_SAVE -- bovine_patch.py fills
+; them with the host's ORIGINAL reset vector so CHAIN can hand control back.
+; START follows immediately, so the patcher knows the entry is BOVBASE+8.
+;***********************************************************************
+        ORG     BOVBASE
+VEC_SAVE:
+        DC.W    $0000           ; host word0 (ZK:SK:PK)  -- patcher-filled
+        DC.W    $0000           ; host word1 (PC)        -- patcher-filled
+        DC.W    $0000           ; host word2 (SP)        -- patcher-filled
+        DC.W    $0000           ; host word3 (IZ)        -- patcher-filled
+START:
+        LDE     #$00FF          ; E low = $FF : not started from a slot
+        ELSE
         IFDEF   SLOTBASE
         ORG     SLOTBASE
         DC.W    SLOTMAG         ; live-slot header
@@ -246,6 +283,7 @@ START:
 START:
         LDE     #$00FF          ; E low = $FF : not started from a slot
         ENDIF
+        ENDIF
         ORP     #$00E0          ; CCR: set interrupt priority mask IP=7
                                 ; (interrupts off; also reset default)
 
@@ -264,8 +302,14 @@ START:
 ; before doing anything else.  SYPCR bit7 (SWE)=0 disables it, and writing $00
 ; also clears the bus/halt monitors.  (The EXTERNAL DS1232 is a separate part,
 ; serviced by STROBE, not by this register.)
+;
+; BOVINE: SYPCR is WRITE-ONCE and belongs to the host firmware, so the cow must
+; not touch it before deciding to chain.  It is written only on the escape path
+; (BOVESC), once the cow has committed to the dumper and will never chain back.
+        IFNDEF  BOVINE
         CLRA
         STAA    SYPCR           ; SYPCR = $00  (EK=$F -> $FFA21)
+        ENDIF
 
 ; --- Watchdog strobe pin + TXD pin -----------------------------------
 ; PQS1 drives the external DS1232 (U24) /ST input (board schematic: U24 pin 7
@@ -293,6 +337,10 @@ START:
 ; Read-modify-write CSPAR0 so only the CS0 field changes: CSBOOT's field holds
 ; the boot port width (8-bit for the 27C040) and must be left as reset set it.
 ; Derived from the HC16Z1 SIM chip-select register layout + the board map.
+; BOVINE: CS0 frames the SRAM, only needed for the dump; programmed on the
+; escape path (BOVESC), not before the chain decision.  (The host reprograms
+; all chip selects from scratch at its own reset anyway.)
+        IFNDEF  BOVINE
         LDD     CSPAR0
         ANDD    #~CSP0_MSK
         ORD     #CSP0_8
@@ -301,6 +349,7 @@ START:
         STD     CSBAR0          ; $F80000, 256 KB
         LDD     #CSO0VAL
         STD     CSOR0           ; enable: both bytes, R/W, 2 wait states
+        ENDIF
 
 ; --- Bring up the SCI ------------------------------------------------
         LDD     #SCBRVAL
@@ -311,6 +360,50 @@ START:
 ; All strings (slot line, banner, done message) live in this image's bank.
         LDAB    #((banner>>16)&$F)
         TBYK                    ; YK = this image's bank
+
+        IFDEF   BOVINE
+;-----------------------------------------------------------------------
+; Bovine front-end: announce, then open the escape window.  Y = outer pass
+; counter; X = inner spin.  Each outer pass feeds the DS1232 (STROBE) and the
+; on-chip COP (SWSR $55,$AA -- SYPCR is left untouched) and polls RDRF.  A byte
+; within the window -> BOVESC (dumper); the window elapsing -> CHAIN (host).
+;-----------------------------------------------------------------------
+        PUTS    bovmsg,BOVMSG_LEN,pbv1,pbv2
+        LDY     #BOVWAIT
+BOVWT:
+        STROBE                          ; feed the external DS1232
+        LDAB    #COP_A
+        STAB    SWSR,Z...
+        LDAB    #COP_B
+        STAB    SWSR,Z...
+        BRSET   SCSR_LO,Z,#RDRF,BOVESC  ; a byte arrived -> escape to the dumper
+        LDX     #$FFFF                  ; inner delay spin
+BOVIN:
+        AIX     #-1
+        CPX     #0
+        BNE     BOVIN
+        AIY     #-1                     ; one outer pass done
+        CPY     #0
+        BNE     BOVWT
+        LBRA    CHAIN                   ; window elapsed -> hand control to host
+
+BOVESC:
+; Committed to the dumper: now safe to claim SYPCR (we will never chain back)
+; and frame the SRAM on CS0, then join the shared mode-select loop.
+        CLRA
+        STAA    SYPCR                   ; disable COP + bus/halt monitors
+        LDD     CSPAR0
+        ANDD    #~CSP0_MSK
+        ORD     #CSP0_8
+        STD     CSPAR0                  ; CS0 pin = 8-bit chip select
+        LDD     #CSB0VAL
+        STD     CSBAR0                  ; $F80000, 256 KB
+        LDD     #CSO0VAL
+        STD     CSOR0                   ; enable: both bytes, R/W, 2 wait states
+        LDD     SCDR,Z                  ; consume the escape byte (clears RDRF)
+        LDX     #$0000                  ; SRAM read offset for the transfer
+        LBRA    SELECT
+        ENDIF
 
         IFDEF   SLOTBASE
 ;-----------------------------------------------------------------------
