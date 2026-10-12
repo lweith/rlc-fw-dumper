@@ -123,12 +123,21 @@ The slot scheme owns the reset vector. The **bovine** build instead rides
 inside a complete, unrelated **host** firmware image: it is relocated (via the
 same `-D` hook as a slot, here `-D BOVBASE`) into a run of blank `$FF` in the
 host, and the reset vector is redirected to it. On boot the cow prints a
-one-line prompt and opens a ~5 s window:
+one-line prompt and opens a **5 s** window (timed by the on-chip GPT
+free-running counter at prescale /256 — one wrap per second — so it is accurate
+on real silicon, not a cycle-counted guess; `BOVSECS` is the knob):
 
-- **a key arrives** → it finishes bring-up (SYPCR, CS0) and enters the normal
-  dumper / monitor;
-- **the window elapses** → it restores a reset CPU state and jumps to the
-  host's saved entry, which boots exactly as if the cow were not there.
+- **a key arrives** → it finishes bring-up (SYPCR, CS0), prints the ASCII-cow
+  banner, and acts on that same key: `g` → the monitor, an XMODEM `NAK` → the
+  256 KB dump, any other key → shows the menu and waits for `g`/`NAK`. One
+  keypress is enough.
+- **the window elapses** → it prints `booting host...` (so the hand-off is
+  visible on serial), restores a reset CPU state, and jumps to the host's saved
+  entry, which boots exactly as if the cow were not there.
+
+Build the cow against the **matching product's** firmware — base `Club-*.bin`
+for an RLC-Club, `ClubDlx2-*.bin` for a Deluxe II. Grafting the wrong product's
+image chains to code that will not run on the board (silent no-boot).
 
 ```
 make bovine FW=host.bin                  # graft cow into your image -> bovine.bin

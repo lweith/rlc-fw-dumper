@@ -2,6 +2,23 @@
 
 Versions follow semver as described under "Versioning" in `README.md`.
 
+## 1.3.0
+
+- Bovine escape window is now timed by the on-chip GPT free-running counter
+  (TCNT, prescale /256 = one wrap/second), counting `BOVSECS` (default 5)
+  seconds. Accurate on real silicon regardless of instruction timing, unlike
+  the old cycle-counted delay loop. No external chip (not the DS1286 RTC) and
+  no SRAM write.
+- One keypress now acts immediately: the key that breaks in is the mode byte —
+  `g` enters the monitor, an XMODEM `NAK` starts the dump, any other key shows a
+  menu and waits. No more silent two-step.
+- On a keypress the cow prints the full ASCII-cow banner (`banner.bin`), and on
+  time-out it prints `booting host...` so the hand-off is visible on serial.
+- Verified in MAME on the matching machine for each product (base `rlcclub` with
+  `Club-v2.16`, and `rlcclubd2` with `ClubDlx2-v2.16`): do-nothing chains to the
+  host banner; a keypress reaches the cow (`V` -> `COW1`). Reminder: build the
+  cow against the firmware for the actual board — wrong product = silent no-boot.
+
 ## 1.2.1
 
 - Bovine: keep the on-chip COP watchdog alive for the whole of the cow's run.

@@ -118,15 +118,17 @@ BLKSZ   EQU     128             ; XMODEM data bytes per block
 ; service protocol, SCI) only; nothing from the host firmware.
 COP_A   EQU     $55             ; COP service sequence byte 1 (SWSR)
 COP_B   EQU     $AA             ; COP service sequence byte 2 (SWSR)
-; Escape window length = BOVWAIT * BOVINNER iterations of the wait loop, which
-; STROBEs (DS1232 + COP) once per iteration.  Defaults aim at ~5 s @ 16.78 MHz;
-; both are build knobs (raise/lower for a longer/shorter window).  Timing is a
-; busy-loop estimate, not timer-exact.
-        IFNDEF  BOVWAIT
-BOVWAIT EQU     85              ; outer passes
-        ENDIF
-        IFNDEF  BOVINNER
-BOVINNER EQU    $8000           ; inner iterations per outer pass (32768)
+; Escape window: timed by the on-chip GPT free-running counter (TCNT), not a
+; cycle-counted delay loop, so it is accurate on real silicon regardless of
+; instruction timing.  GPT registers (module block, EK=$F):
+GPTMCR  EQU     $F900           ; GPT module control (write 0 -> running)
+TCNT    EQU     $F90A           ; free-running counter (16-bit; read hi byte)
+TMSK2   EQU     $F921           ; timer mask 2: CPR[2:0] = prescale select
+TCPR256 EQU     $06             ; CPR=110 -> system clock / 256
+; At f_sys = 16.777216 MHz, /256 makes TCNT wrap once per SECOND exactly
+; (65536*256/16777216 = 1.000 s), so the window counts BOVSECS wraps.
+        IFNDEF  BOVSECS
+BOVSECS EQU     5               ; escape window in seconds (build knob)
         ENDIF
 
 ;-----------------------------------------------------------------------
@@ -396,32 +398,45 @@ START:
 
         IFDEF   BOVINE
 ;-----------------------------------------------------------------------
-; Bovine front-end: announce, then open the escape window.  Y = outer pass
-; counter; X = inner spin.  Each outer pass feeds the DS1232 (STROBE) and the
-; on-chip COP (SWSR $55,$AA -- SYPCR is left untouched) and polls RDRF.  A byte
-; within the window -> BOVESC (dumper); the window elapsing -> CHAIN (host).
+; Bovine front-end: announce, then open the escape window, timed by the GPT
+; free-running counter (TCNT) at prescale /256 = one wrap per second.  X counts
+; seconds; each pass STROBEs (DS1232 + COP, SYPCR untouched) and polls RDRF, so
+; a key is caught at once and neither watchdog starves.  A key -> BOVESC
+; (dumper); BOVSECS seconds elapsed -> CHAIN (host).  One "second" = one TCNT
+; MSB 1->0 wrap: wait for the MSB to go high, then low, then count it.
 ;-----------------------------------------------------------------------
         PUTS    bovmsg,BOVMSG_LEN,pbv1,pbv2
-        LDY     #BOVWAIT
-; Y = outer passes, X = inner spin.  STROBE (DS1232 + COP) and the RDRF poll run
-; on EVERY inner iteration, so neither watchdog can starve during the delay and
-; a keypress is caught promptly.  ~BOVWAIT*BOVINNER iterations total.
-BOVWT:
-        LDX     #BOVINNER               ; inner spin count
-BOVIN:
-        STROBE                          ; feed DS1232 + COP every iteration
-        BRSET   SCSR_LO,Z,#RDRF,BOVESC  ; a byte arrived -> escape to the dumper
-        AIX     #-1
-        CPX     #0
-        BNE     BOVIN
-        AIY     #-1                     ; one outer pass done
-        CPY     #0
-        BNE     BOVWT
-        LBRA    CHAIN                   ; window elapsed -> hand control to host
+        LDD     #$0000
+        STD     GPTMCR                  ; GPT running (STOP=0), normal mode
+        LDAB    #TCPR256
+        STAB    TMSK2                   ; prescale = system clock / 256
+        LDX     #0                      ; seconds elapsed
+BOVSEC:
+BOVHI:
+        STROBE                          ; feed DS1232 + COP
+        BRSET   SCSR_LO,Z,#RDRF,BOVESC  ; key -> escape to the dumper
+        LDAB    TCNT                    ; B = TCNT high byte
+        BITB    #$80                    ; MSB (bit 15) set?
+        BEQ     BOVHI                   ; wait until the MSB is high
+BOVLO:
+        STROBE
+        BRSET   SCSR_LO,Z,#RDRF,BOVESC
+        LDAB    TCNT
+        BITB    #$80
+        BNE     BOVLO                   ; wait until the MSB falls (wrap) = 1 s
+        INX                             ; one second elapsed
+        CPX     #BOVSECS
+        BLO     BOVSEC
+        ; window elapsed: say so (so the hand-off is visible on serial), then
+        ; chain to the host.
+        PUTS    bootmsg,BOOTMSG_LEN,pbt1,pbt2
+        LBRA    CHAIN
 
 BOVESC:
-; Committed to the dumper: now safe to claim SYPCR (we will never chain back)
-; and frame the SRAM on CS0, then join the shared mode-select loop.
+; A key broke in. Commit to the dumper: claim SYPCR (we will never chain back),
+; frame the SRAM on CS0, announce the options, then act on the key that woke us
+; -- one keypress is enough (g -> monitor, XMODEM NAK -> dump; any other key
+; just shows the menu and waits for g/NAK).
         CLRA
         STAA    SYPCR                   ; disable COP + bus/halt monitors
         LDD     CSPAR0
@@ -432,9 +447,43 @@ BOVESC:
         STD     CSBAR0                  ; $F80000, 256 KB
         LDD     #CSO0VAL
         STD     CSOR0                   ; enable: both bytes, R/W, 2 wait states
-        LDD     SCDR,Z                  ; consume the escape byte (clears RDRF)
+; Show the ASCII cow (the embedded banner), byte-transparently -- drop CR,
+; expand LF -> CR,LF, emit the rest verbatim -- exactly as the standalone build
+; prints it.  YK already = this image's bank (set at init).  The key that broke
+; in waits in SCDR (RDRF set) until read below, so printing does not lose it.
+        LDY     #(banner&$FFFF)
+        LDX     #BANNER_LEN
+BOVBAN:
+        CPX     #0
+        BEQ     BOVBANX
+        LDAB    0,Y
+        AIY     #1
+        AIX     #-1
+        CMPB    #CR
+        BEQ     BOVBAN                  ; drop CR
+        CMPB    #LF
+        BNE     BOVBANS
+        LDAB    #CR                     ; LF -> CR,LF
+        SENDB
+        LDAB    #LF
+        SENDB
+        BRA     BOVBAN
+BOVBANS:
+        SENDB                           ; emit verbatim
+        BRA     BOVBAN
+BOVBANX:
+        PUTS    bovready,BOVREADY_LEN,pbr1,pbr2
+        LDD     SCDR,Z                  ; B = the key that broke in (clears RDRF)
         LDX     #$0000                  ; SRAM read offset for the transfer
-        LBRA    SELECT
+BOVSEL:
+        CMPB    #NAK
+        LBEQ    DODUMP
+        CMPB    #MON_G
+        LBEQ    MONITOR
+        CMPB    #MON_GU
+        LBEQ    MONITOR
+        RECVB   rbsel                   ; not a mode byte yet -> wait for g/NAK
+        BRA     BOVSEL
         ENDIF
 
         IFDEF   SLOTBASE
@@ -743,8 +792,9 @@ MON_J:
 ; PK nibble is 0 before it builds the image.
 ;-----------------------------------------------------------------------
 CHAIN:
-        LDD     #$0000
-        STD     SCCR1,Z         ; SCI TE/RE off (needs ZK=$F/Z=QSM -- still set)
+        ; Leave the SCI as-is -- the host reinitialises SCCR0/1 at its own reset,
+        ; and not touching it here lets the "booting host..." line finish
+        ; transmitting before we jump.
         CLRB
         TBEK                    ; EK = 0  (host reset value)
         TBZK                    ; ZK = 0
@@ -789,10 +839,18 @@ MISMSG_LEN      EQU     mismsg_end-mismsg
 ; here -- this is a source literal, not the staged banner file.
 ;-----------------------------------------------------------------------
 bovmsg:
-        DC.B    $0D,$0A,"MOO! bovine boot. Press any key for dumper/monitor, "
-        DC.B    "else booting host...",$0D,$0A
+        DC.B    $0D,$0A,"MOO! bovine boot. Key within ~5 s to break in "
+        DC.B    "(g=monitor, or start XMODEM to dump); else booting host.",$0D,$0A
 bovmsg_end:
 BOVMSG_LEN      EQU     bovmsg_end-bovmsg
+bovready:
+        DC.B    $0D,$0A,"break: g=monitor, or start XMODEM to dump.",$0D,$0A
+bovready_end:
+BOVREADY_LEN    EQU     bovready_end-bovready
+bootmsg:
+        DC.B    $0D,$0A,"booting host...",$0D,$0A
+bootmsg_end:
+BOOTMSG_LEN     EQU     bootmsg_end-bootmsg
         ENDIF
 
 ;-----------------------------------------------------------------------
