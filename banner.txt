@@ -5,7 +5,7 @@
          *  /\---/\
             ~~   ~~
 
-  RLC-Club config dumper v1.1 de KN6FLN
+  RLC-Club config dumper de KN6FLN
 
 Source: NVSRAM $F80000-$FBFFFF, 256 KB
 Xfer:   XMODEM checksum, 2048 x 128B, @BAUD@ 8N1

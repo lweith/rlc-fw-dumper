@@ -115,6 +115,7 @@ CMD_W   EQU     $57             ; 'W' : write bank,hi,lo,data  -> 'K'
 CMD_X   EQU     $58             ; 'X' : read SYNCR (clock/SLOCK) -> hi,lo
 CMD_J   EQU     $4A             ; 'J' : jump hi,lo (bank-0 program space; experimental)
 CMD_S   EQU     $53             ; 'S' : boot slot index -> 1 byte ($FF = not slotted)
+CMD_I   EQU     $49             ; 'I' : identify -> "VERSION (BRANCH, DATE)",CR,LF
 ACKCHR  EQU     $4B             ; 'K' : write acknowledge
 
 ;-----------------------------------------------------------------------
@@ -312,6 +313,14 @@ START:
         LDAB    #((banner>>16)&$F)
         TBYK                    ; YK = this image's bank
 
+; Identify the build first, whatever banner it carries: "sram_dump VERSION
+; (BRANCH, DATE)" from the Makefile-staged ident.bin.
+        PUTS    identmsg,IDENTMSG_LEN,pid1,pid2
+        LDAB    #CR
+        SENDB
+        LDAB    #LF
+        SENDB
+
         IFDEF   SLOTBASE
 ;-----------------------------------------------------------------------
 ; Report the slot the stub started us from (E low), and flag it if that is
@@ -494,6 +503,8 @@ DONE:
 ;   'W' bank hi lo data      -> writes one byte, replies 'K'
 ;   'J' hi lo                -> JMP to bank-0 program address hi:lo (experimental)
 ;   'S'                      -> boot slot index, 1 byte ($FF = not slotted)
+;   'I'                      -> "VERSION (BRANCH, DATE)",CR,LF  (which build)
+; 'V' stays "COW1": it names the monitor protocol revision, not the build.
 ; The monitor uses NO RAM: addresses are assembled in registers (GETADR), so
 ; R/W can probe module registers (e.g. the chip selects) even when external
 ; SRAM does not respond.  'X' is the live clock probe (SYNCR; SLOCK = lo bit3).
@@ -530,6 +541,8 @@ MONLOOP:
         LBEQ    MON_J
         CMPB    #CMD_S
         LBEQ    MON_S
+        CMPB    #CMD_I
+        LBEQ    MON_I
         BRA     MONLOOP         ; unknown command -> ignore, resync
 
 MON_V:
@@ -584,6 +597,14 @@ MON_S:
         SENDB
         LBRA    MONLOOP
 
+MON_I:
+        PUTS    ident,IDENT_LEN,pim1,pim2   ; YK = image bank since bring-up
+        LDAB    #CR
+        SENDB
+        LDAB    #LF
+        SENDB
+        LBRA    MONLOOP
+
 MON_J:
         CLRB
         TBXK                    ; XK = 0 : JMP ind20 takes its bank from XK
@@ -627,8 +648,21 @@ banner:
 banner_end:
 BANNER_LEN      EQU     banner_end-banner
 
+;-----------------------------------------------------------------------
+; Build identification, staged by the Makefile from version.sh as ident.bin:
+; "VERSION (BRANCH, DATE)", no line ending.  Printed at boot after the
+; "sram_dump " prefix, and alone by monitor 'I'.  Also visible to `strings`.
+;-----------------------------------------------------------------------
+identmsg:
+        DC.B    "sram_dump "
+ident:
+        BINCLUDE "ident.bin"
+ident_end:
+IDENTMSG_LEN    EQU     ident_end-identmsg
+IDENT_LEN       EQU     ident_end-ident
+
         IFDEF   SLOTBASE
-        IF      banner_end > SLOTBASE+SLOTSZ
+        IF      ident_end > SLOTBASE+SLOTSZ
         ERROR   "image overflows its slot (raise SLOTSZ or shrink the banner)"
         ENDIF
         ENDIF

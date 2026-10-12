@@ -25,6 +25,43 @@ only the ~600 used bytes. No `truncate`; the image is exactly **524288 bytes**,
 reset vector at offset 0, code at `$0200`, banner right after the code, `$FF`
 everywhere else. Result: **0 errors, 0 warnings.**
 
+## Versioning
+
+Every image says which source built it. It boots with
+
+```
+sram_dump 1.1.0+g1a2b3c4 (main, 2026-10-12)
+```
+
+and the monitor's `I` command returns the same text without the prefix.
+`version.sh` derives it from git: the version from the nearest `vX.Y.Z` tag,
+`+gHASH` for the commit, then the branch and the **commit** date. It uses the
+commit date rather than the build time, so building a clean commit always gives
+the same bytes, and a chip readback can be compared against a rebuild of the
+commit it names.
+
+| checkout | version |
+|---|---|
+| at tag `vX.Y.Z`, clean | `X.Y.Z+gHASH` |
+| N commits past it | `X.Y.(Z+1)-dev.N+gHASH` (pre-release of the next patch) |
+| uncommitted changes | `….dirty` appended |
+| outside git | `0.0.0+unknown`, or `make VERSION=… BRANCH=… CDATE=…` |
+
+Version numbers follow [semver](https://semver.org). What they promise to keep
+stable is everything outside the image that depends on it:
+
+- the monitor protocol (commands, reply formats, the `K` ack, `V` → `COW1`);
+- the boot and dump behaviour (mode-select byte, XMODEM format, dump range);
+- the slot contract: `SLOTSZ`, the `$C057` header, revocation by `$00`, and the
+  slot index handed over in E. A stub burned into a chip has to keep booting
+  every later slot image;
+- the make variables (`BAUD BANNER OUT SLOT BASE SLOTSZ DEV`).
+
+Breaking any of them is a **major** release, adding to them (a monitor command,
+a build variant) is **minor**, and a fix that changes none of them is a
+**patch**. `V`'s `COW1` is the monitor *protocol* revision and changes only
+with a major release; `I` is the way to identify the build. See `CHANGELOG.md`.
+
 ## Append-only boot ROM (slots) — reburn without erasing
 
 Programming only clears bits (1→0), so a blank (`$FF`) region of an

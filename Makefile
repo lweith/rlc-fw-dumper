@@ -22,8 +22,13 @@
 # minipro command; set DEV= to your part (e.g. DEV=AM27C040).
 #
 # The BANNER file is embedded verbatim into the image; the firmware prints it
-# over the SCI before the XMODEM transfer. Edit header.txt (or point BANNER= at
+# over the SCI before the XMODEM transfer. Edit banner.txt (or point BANNER= at
 # any file) and re-run make -- no source edit needed.
+#
+# Every image identifies its source: version.sh derives a semver string, the
+# branch and the commit date from git, the firmware prints them at boot and
+# monitor command 'I' returns them. Outside a git checkout, pass them in:
+#   make VERSION=1.1.0 BRANCH=release CDATE=2026-10-12
 #
 # NOTE: comments stay on their OWN lines. An inline comment after a value
 # (VAR := x   # ...) captures the trailing spaces INTO the value in Make.
@@ -50,6 +55,12 @@ IMGTOP  := 0x7ffff
 FILL    := 0xff
 # STAGE = fixed name the source BINCLUDEs
 STAGE   := banner.bin
+# IDSTAGE = the identification line the source BINCLUDEs: VERSION (BRANCH, CDATE)
+IDSTAGE := ident.bin
+VINFO   := $(shell sh ./version.sh)
+VERSION ?= $(word 1,$(VINFO))
+BRANCH  ?= $(word 2,$(VINFO))
+CDATE   ?= $(word 3,$(VINFO))
 
 # SLOTSZ = bytes per boot-ROM slot. FIXED for the life of a chip once its stub
 #          is burned: every later slot build must use the same value.
@@ -66,7 +77,7 @@ STUB    := boot_stub
 SLOTB    = $(shell echo $$(( $(SLOT) * $(SLOTSZ) )))
 SLOTE    = $(shell echo $$(( $(SLOT) * $(SLOTSZ) + $(SLOTSZ) - 1 )))
 
-.PHONY: all clean stub patch
+.PHONY: all clean stub patch FORCE
 
 all: $(OUT)
 
@@ -77,9 +88,8 @@ stub: $(STUB).s
 	$(P2BIN) $(STUB).p $(STUB).bin -l $(FILL) -r 0x0-$(IMGTOP)
 
 # Dumper assembled to run from slot SLOT, overlaid with the stub onto BASE.
-patch: stub $(SRC) $(BANNER)
+patch: stub $(SRC) $(STAGE) $(IDSTAGE)
 	@test -n "$(SLOT)" || { echo "usage: make patch SLOT=n [BASE=readback.bin]"; exit 1; }
-	sed 's/@BAUD@/$(BAUD)/g' "$(BANNER)" > $(STAGE)
 	$(ASL) -cpu $(CPU) -D SCBRVAL=$(SCBR) -D SLOTSZ=$(SLOTSZ) -D SLOTBASE=$(SLOTB) \
 		-o slot$(SLOT).p -olist slot$(SLOT).lst -L $(SRC)
 	$(P2BIN) slot$(SLOT).p slot$(SLOT)_raw.bin -l $(FILL) -r $(SLOTB)-$(SLOTE)
@@ -87,14 +97,27 @@ patch: stub $(SRC) $(BANNER)
 		0:$(STUB)_raw.bin $(SLOTB):slot$(SLOT)_raw.bin
 	@echo "burn:   minipro -p $(DEV) -w $(PATCH)    (add -e if the part is FLASH: no erase!)"
 
-# Rebuild whenever the source OR the chosen banner file changes.
-$(OUT): $(SRC) $(BANNER)
-	sed 's/@BAUD@/$(BAUD)/g' "$(BANNER)" > $(STAGE)
+# Rebuild whenever the source, the banner or the identification changes.
+$(OUT): $(SRC) $(STAGE) $(IDSTAGE)
 	$(ASL) -cpu $(CPU) -D SCBRVAL=$(SCBR) -L $(SRC)
 	$(P2BIN) $(STEM).p $(OUT) -l $(FILL) -r 0x0-$(IMGTOP)
-	@echo "built $(OUT) from banner '$(BANNER)' at $(BAUD) baud (SCBR=$(SCBR)):"
+	@echo "built $(OUT) $(VERSION) ($(BRANCH), $(CDATE)) from banner '$(BANNER)' at $(BAUD) baud (SCBR=$(SCBR)):"
 	@ls -l $(OUT)
 
+# The staged files are regenerated on every run but replaced only when their
+# content changes, so a new commit rebuilds the image and an unchanged tree
+# does not. The banner may use @BAUD@ @VERSION@ @BRANCH@ @DATE@.
+$(STAGE): $(BANNER) FORCE
+	@sed -e 's|@BAUD@|$(BAUD)|g' -e 's|@VERSION@|$(VERSION)|g' \
+		-e 's|@BRANCH@|$(BRANCH)|g' -e 's|@DATE@|$(CDATE)|g' "$(BANNER)" > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
+$(IDSTAGE): FORCE
+	@printf '%s' '$(VERSION) ($(BRANCH), $(CDATE))' > $@.tmp
+	@cmp -s $@.tmp $@ && rm -f $@.tmp || mv $@.tmp $@
+
+FORCE:
+
 clean:
-	rm -f $(OUT) $(STAGE) $(STEM).p $(STEM).lst $(STUB).p $(STUB).lst $(STUB).bin \
-		$(STUB)_raw.bin slot*.p slot*.lst slot*_raw.bin $(PATCH)
+	rm -f $(OUT) $(STAGE) $(IDSTAGE) *.tmp $(STEM).p $(STEM).lst $(STUB).p $(STUB).lst \
+		$(STUB).bin $(STUB)_raw.bin slot*.p slot*.lst slot*_raw.bin $(PATCH)
