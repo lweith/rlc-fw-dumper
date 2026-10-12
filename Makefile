@@ -35,6 +35,9 @@
 
 ASL     ?= asl
 P2BIN   ?= p2bin
+# CC/CFLAGS build rlcpatch, the small C image-surgery helper (no Python).
+CC      ?= cc
+CFLAGS  ?= -O2 -std=c89 -Wall
 CPU     := 68HC16
 SRC     := sram_dump.s
 STEM    := $(basename $(SRC))
@@ -77,9 +80,25 @@ STUB    := boot_stub
 SLOTB    = $(shell echo $$(( $(SLOT) * $(SLOTSZ) )))
 SLOTE    = $(shell echo $$(( $(SLOT) * $(SLOTSZ) + $(SLOTSZ) - 1 )))
 
-.PHONY: all clean stub patch FORCE
+# --- Bovine bootloader (`make bovine FW=host.bin`) -------------------------
+# FW = the host firmware image to graft the cow into (bring your own; e.g. a
+#      minipro readback of your current chip, or an RLC update image).
+# BOVBASE = where the cow lands in the host's free space. Default $2D000 sits
+#      in the large $FF gap of the v2.1x ClubDlx2 images; override for others.
+# BOVOUT = grafted output image. The host's entry PC/IZ are read out of FW by
+#          rlcpatch inside the recipe (so no parse-time tooling is needed).
+FW      ?=
+BOVBASE ?= 0x2D000
+BOVOUT  ?= bovine.bin
+PATCHER := rlcpatch
+
+.PHONY: all clean stub patch bovine FORCE
 
 all: $(OUT)
+
+# The C image-surgery helper (replaces the old Python patchers).
+$(PATCHER): $(PATCHER).c
+	$(CC) $(CFLAGS) -o $@ $<
 
 # Slot 0 only, assembled for SLOTSZ; boot_stub.bin is the full 512 KB view.
 stub: $(STUB).s
@@ -88,14 +107,29 @@ stub: $(STUB).s
 	$(P2BIN) $(STUB).p $(STUB).bin -l $(FILL) -r 0x0-$(IMGTOP)
 
 # Dumper assembled to run from slot SLOT, overlaid with the stub onto BASE.
-patch: stub $(SRC) $(STAGE) $(IDSTAGE)
+patch: stub $(SRC) $(STAGE) $(IDSTAGE) $(PATCHER)
 	@test -n "$(SLOT)" || { echo "usage: make patch SLOT=n [BASE=readback.bin]"; exit 1; }
 	$(ASL) -cpu $(CPU) -D SCBRVAL=$(SCBR) -D SLOTSZ=$(SLOTSZ) -D SLOTBASE=$(SLOTB) \
 		-o slot$(SLOT).p -olist slot$(SLOT).lst -L $(SRC)
 	$(P2BIN) slot$(SLOT).p slot$(SLOT)_raw.bin -l $(FILL) -r $(SLOTB)-$(SLOTE)
-	python3 -I rom_patch.py --base "$(BASE)" --out $(PATCH) --slotsz $(SLOTSZ) \
+	./$(PATCHER) overlay --base "$(BASE)" --out $(PATCH) --slotsz $(SLOTSZ) \
 		0:$(STUB)_raw.bin $(SLOTB):slot$(SLOT)_raw.bin
 	@echo "burn:   minipro -p $(DEV) -w $(PATCH)    (add -e if the part is FLASH: no erase!)"
+
+# Bovine: assemble the cow for BOVBASE with the host's entry/IZ baked in, then
+# graft it into FW and redirect the reset vector. Full image -> ERASE + burn.
+# $(STAGE)/$(IDSTAGE) stage banner.bin + ident.bin (with version substitution)
+# before asl, so the cow identifies its build like every other target.
+bovine: $(SRC) $(STAGE) $(IDSTAGE) $(PATCHER)
+	@test -n "$(FW)" || { echo "usage: make bovine FW=host.bin [BOVBASE=0x2D000]"; exit 1; }
+	$(ASL) -cpu $(CPU) -D SCBRVAL=$(SCBR) -D BOVINE -D BOVBASE=$(BOVBASE) \
+		-D HOSTPC=`./$(PATCHER) probe-pc "$(FW)"` \
+		-D HOSTIZ=`./$(PATCHER) probe-iz "$(FW)"` \
+		-o bovine.p -olist bovine.lst -L $(SRC)
+	$(P2BIN) bovine.p bovine_raw.bin -l $(FILL)
+	./$(PATCHER) bovine --fw "$(FW)" --cow bovine_raw.bin \
+		--base $(BOVBASE) --out $(BOVOUT)
+	@echo "burn:   minipro -p $(DEV) -w $(BOVOUT)    (UV EPROM: erase first)"
 
 # Rebuild whenever the source, the banner or the identification changes.
 $(OUT): $(SRC) $(STAGE) $(IDSTAGE)
@@ -120,4 +154,5 @@ FORCE:
 
 clean:
 	rm -f $(OUT) $(STAGE) $(IDSTAGE) *.tmp $(STEM).p $(STEM).lst $(STUB).p $(STUB).lst \
-		$(STUB).bin $(STUB)_raw.bin slot*.p slot*.lst slot*_raw.bin $(PATCH)
+		$(STUB).bin $(STUB)_raw.bin slot*.p slot*.lst slot*_raw.bin $(PATCH) \
+		bovine.p bovine.lst bovine_raw.bin $(BOVOUT) $(PATCHER)
