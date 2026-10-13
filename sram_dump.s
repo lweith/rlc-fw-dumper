@@ -123,13 +123,13 @@ COP_B   EQU     $AA             ; COP service sequence byte 2 (SWSR)
 ; instruction timing.  GPT registers (module block, EK=$F):
 GPTMCR  EQU     $F900           ; GPT module control (write 0 -> running)
 TCNT    EQU     $F90A           ; free-running counter (16-bit; read hi byte)
-TMSK2   EQU     $F921           ; timer mask 2: CPR[2:0] = prescale select
-TCPR256 EQU     $06             ; CPR=110 -> system clock / 256
-; At f_sys = 16.777216 MHz, /256 makes TCNT wrap once per SECOND exactly
-; (65536*256/16777216 = 1.000 s), so the window counts BOVSECS wraps.
+; At f_sys = 16.777216 MHz and the reset prescaler (/4), TCNT wraps 64 times a
+; second exactly (65536*4/16777216 = 1/64 s); the window counts BOVTICKS wraps.
+; (The prescaler is NOT changed: CPR is write-once and is the host's.)
         IFNDEF  BOVSECS
 BOVSECS EQU     5               ; escape window in seconds (build knob)
         ENDIF
+BOVTICKS EQU    BOVSECS*64
 
 ;-----------------------------------------------------------------------
 ; [main-session addition] Serial monitor ("cow monitor") selection + opcodes.
@@ -406,11 +406,15 @@ START:
 ; MSB 1->0 wrap: wait for the MSB to go high, then low, then count it.
 ;-----------------------------------------------------------------------
         PUTS    bovmsg,BOVMSG_LEN,pbv1,pbv2
+        ; TMSK2's prescaler field (CPR) is WRITE-ONCE after reset (User's
+        ; Manual 8.7) and belongs to the host: the window runs on the reset
+        ; prescaler (/4), where TCNT wraps every 65536*4/16.78 MHz = 1/64 s,
+        ; and counts BOVTICKS wraps.  (1.3.0/1.4.0 wrote /256 here; the
+        ; restore in CHAIN was then ignored and the host ran 64x slow.)
+        ; GPTMCR is written its reset value only.
         LDD     #$0000
         STD     GPTMCR                  ; GPT running (STOP=0), normal mode
-        LDAB    #TCPR256
-        STAB    TMSK2                   ; prescale = system clock / 256
-        LDX     #0                      ; seconds elapsed
+        LDX     #0                      ; TCNT wraps elapsed
 BOVSEC:
 BOVHI:
         STROBE                          ; feed DS1232 + COP
@@ -423,9 +427,9 @@ BOVLO:
         BRSET   SCSR_LO,Z,#RDRF,BOVESC
         LDAB    TCNT
         BITB    #$80
-        BNE     BOVLO                   ; wait until the MSB falls (wrap) = 1 s
-        INX                             ; one second elapsed
-        CPX     #BOVSECS
+        BNE     BOVLO                   ; wait until the MSB falls (wrap) = 1/64 s
+        AIX     #1                      ; one wrap elapsed
+        CPX     #BOVTICKS
         BLO     BOVSEC
         ; window elapsed: say so (so the hand-off is visible on serial), then
         ; chain to the host.
@@ -772,7 +776,8 @@ MON_I:
 
 MON_J:
         CLRB
-        TBXK                    ; XK = 0 : JMP ind20 takes its bank from XK
+        TBXK                    ; XK = 0 (the 20-bit indexed JMP ignores XK on
+                                ; silicon -- manual 5.5.3 -- so 'J' reaches bank 0)
         GETADR  rj1,rj2         ; X = hi:lo
         JMP     0,X             ; jump to bank-0 program address hi:lo
 
@@ -792,13 +797,9 @@ MON_J:
 ; PK nibble is 0 before it builds the image.
 ;-----------------------------------------------------------------------
 CHAIN:
-        ; Undo what the escape window set up: the GPT prescaler (TMSK2) goes
-        ; back to its reset value, CPR=000 (system clock / 4).  A host that
-        ; leaves TMSK2 at its reset value -- a chain is not a reset -- would
-        ; otherwise run its GPT 64x slow (/256).  GPTMCR was written with its
-        ; reset value ($0000) already.  EK is still $F here.
-        CLRB
-        STAB    TMSK2                   ; prescale = system clock / 4 (reset)
+        ; Nothing of the GPT to undo: the window never wrote TMSK2 (CPR is
+        ; write-once after reset, so a write here -- even of the reset value --
+        ; would use up the host's one write).  GPTMCR got its reset value.
         ; Leave the SCI as-is -- the host reinitialises SCCR0/1 at its own reset,
         ; and not touching it here lets the "booting host..." line finish
         ; transmitting before we jump.

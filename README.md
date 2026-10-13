@@ -170,13 +170,14 @@ architected reset vector, so the hand-off owes nothing to the host's internals:
   a non-512 KB image, a non-bank-0 host entry, an unaligned base, a cow that
   straddles a 64 KB bank, or a landing zone that is not all `$FF`.
 
-- **Everything the cow programs before chaining is undone or rewritten.** A
-  chain is not a reset, so a register the cow sets and the host leaves at its
-  reset value would carry over. The window's GPT prescaler (`TMSK2`, /256) did
-  exactly that in 1.3.0: a host that never writes `TMSK2` ran its whole GPT
-  timebase 64× slow (fixed in 1.3.1: `CHAIN` restores the reset value). The
-  rule for any future change: whatever the cow writes before `CHAIN` is restored
-  there, unless the host is known to rewrite it.
+- **Everything the cow programs before chaining must be undone or rewritten —
+  and some registers cannot be undone at all.** A chain is not a reset, so a
+  register the cow sets and the host leaves at its reset value carries over.
+  The window's GPT prescaler (`TMSK2` CPR, /256) did that in 1.3.0, and since
+  CPR is **write-once after reset** the 1.4.0 restore in `CHAIN` was ignored
+  on silicon: the host ran its GPT 64× slow. Fixed in 1.4.1 by never writing
+  it. The rule: before `CHAIN`, write only registers the host rewrites, or that
+  you can restore and that are not write-once (SYPCR, CPR, ...).
 
 Unlike the slot scheme this is **not** an additive burn: redirecting the reset
 vector needs 0→1 changes, so a UV part must be erased first — unless the
@@ -198,6 +199,14 @@ already-burned chip without erasing (programming only clears bits).
   a stuck bit, or one revoked (first byte programmed to `$00`) is skipped and
   the next lower one tried. **No good slot → it chains straight to the host**,
   so revoking every slot gives back the plain host without an erase.
+- It hands over through a table of absolute (EXT20) JMPs. **Not** `JMP 8,X`
+  with XK = the slot's bank: the 20-bit indexed mode adds its offset to IX only
+  and ignores XK (manual 5.5.3), so the bank must come from the offset. The
+  1.4.0 stub did exactly that and landed in bank 0 on silicon; a chip that
+  carries it is repaired without an erase by `make bovine-stubfix BASE=now.bin`.
+- **The cow must not write TMSK2's prescaler (CPR): it is write-once after
+  reset** (manual 8.7) and belongs to the host. The escape window times itself
+  on the reset prescaler instead.
 - It writes no configuration registers; it services the COP while summing (the
   COP is enabled from reset), and leaves EK/XK = 0 and IZ = the host's, as the
   reset vector had them.
@@ -219,12 +228,16 @@ so a bit stuck at 0 refuses the build instead of burning a broken image; later
 builds overlay onto a readback the same way, and refuse a slot that is in use
 or sits over stuck bits (pick another with `AT=`).
 
-Verified in MAME (base `rlcclub`, `Club-v2.16`): stub → slot 0 → chain gives the
-host's stock timing (timer to the 10 ms, CW ID to the 20 ms); an appended slot 1
-is chosen over slot 0; slot 1 with one cleared body bit is rejected and slot 0
-boots; slot 1 revoked → slot 0; every slot revoked → the host boots directly
-with stock timing; `rptcfg upload` breaks into a slot cow, reads the whole SRAM
-and returns to the host.
+Verified on silicon (RLC-Club, v2.16 host, 1.4.1 cow in a slot behind the
+repaired 1.4.0 stub): stub → slot → MOO → window → chain → host, with the
+host's 10 s timer firing on time. In MAME (base `rlcclub`, `Club-v2.16`, with
+the 20-bit indexed JMP and write-once CPR now modelled): the same at stock
+timing; an appended slot is chosen over an older one; a slot with one cleared
+body bit is rejected; revoked slots fall back; every slot revoked → the host
+boots directly; `rptcfg upload` breaks into a slot cow, reads the whole SRAM
+and returns to the host. Lesson: the 1.4.0 stub and the 1.4.0 TMSK2 restore
+both passed every emulator test and failed on silicon — the emulator agreed
+with our assumptions. Check silicon-facing behaviour against the manual.
 
 Verified in MAME against `ClubDlx2-v2.16`: the window elapsing boots stock
 `V2.16dlx2` cleanly to `DTMF>`, and a keypress drops into the monitor

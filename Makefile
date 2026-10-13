@@ -92,7 +92,7 @@ BOVBASE ?= 0x2D000
 BOVOUT  ?= bovine.bin
 PATCHER := rlcpatch
 
-.PHONY: all clean stub patch bovine bovine-slots bovine-slot bovine-revoke FORCE
+.PHONY: all clean stub patch bovine bovine-slots bovine-slot bovine-revoke bovine-stubfix FORCE
 
 all: $(OUT)
 
@@ -187,6 +187,19 @@ bovine-slot: $(SRC) $(STAGE) $(IDSTAGE) $(PATCHER)
 	./$(PATCHER) bovslot --base "$(BASE)" --cow bovcow_raw.bin --at $(SLOTAT) --out $(BSOUT) $(BSLAYOUT)
 	@echo "burn:   minipro -p $(DEV) -w $(BSOUT)    (NO erase: add -e)"
 
+# Repair a chip that carries the 1.4.0 stub (its hand-over JMP lands in bank 0
+# on silicon) WITHOUT erasing: bovine_stubfix.s turns one branch of the old stub
+# into a jump to a corrected stub in the blank space after it.
+bovine-stubfix: bovine_stubfix.s $(PATCHER)
+	@test "$(BASE)" != "-" || { echo "usage: make bovine-stubfix BASE=readback.bin"; exit 1; }
+	$(ASL) -cpu $(CPU) -D STUBBASE=$(STUBBASE) -D SLOT0=$(BSLOT0) -D SLOTSZ=$(BSLOTSZ) \
+		-D NSLOTS=$(BNSLOTS) -o bovine_stubfix.p -olist bovine_stubfix.lst -L bovine_stubfix.s
+	$(P2BIN) bovine_stubfix.p stubfix_bra.bin -l $(FILL) -r $$(( $(STUBBASE) + 0x4C ))-$$(( $(STUBBASE) + 0x4D ))
+	$(P2BIN) bovine_stubfix.p stubfix_stub2.bin -l $(FILL) -r $$(( $(STUBBASE) + 0x92 ))-$$(( $(STUBBASE) + 0x195 ))
+	./$(PATCHER) overlay --base "$(BASE)" --out $(BSOUT) --slotsz 0 \
+		$$(( $(STUBBASE) + 0x4C )):stubfix_bra.bin $$(( $(STUBBASE) + 0x92 )):stubfix_stub2.bin
+	@echo "burn:   minipro -p $(DEV) -w $(BSOUT)    (NO erase)"
+
 bovine-revoke: $(PATCHER)
 	@test "$(BASE)" != "-" -a -n "$(AT)" || { echo "usage: make bovine-revoke BASE=readback.bin AT=slot-address"; exit 1; }
 	./$(PATCHER) revoke --base "$(BASE)" --at $(AT) --out $(BSOUT) $(BSLAYOUT)
@@ -218,4 +231,4 @@ clean:
 		$(STUB).bin $(STUB)_raw.bin slot*.p slot*.lst slot*_raw.bin $(PATCH) \
 		bovine.p bovine.lst bovine_raw.bin $(BOVOUT) $(PATCHER) \
 		bovine_stub.p bovine_stub.lst bovine_stub_raw.bin bovcow.p bovcow.lst bovcow_raw.bin \
-		bovstub.tmp $(BSOUT)
+		bovstub.tmp $(BSOUT) bovine_stubfix.p bovine_stubfix.lst stubfix_bra.bin stubfix_stub2.bin

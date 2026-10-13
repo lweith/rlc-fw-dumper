@@ -2,6 +2,32 @@
 
 Versions follow semver as described under "Versioning" in `README.md`.
 
+## 1.4.1
+
+Three silicon facts the emulator did not model; all found on a real RLC-Club
+(v2.16 host), confirmed in the MC68HC16Z1 User's Manual, reproduced in MAME
+once modelled, and fixed without erasing the chip.
+
+- The 20-bit indexed JMP adds its offset to the 16-bit index register only, not
+  XK (manual 5.5.3; the 8/16-bit and E-offset modes do use XK). The 1.4.0 stub's
+  `JMP 8,X` therefore landed in bank 0 on silicon (slot 0: the host's vector
+  table, which happened to boot the host; other slots: a silent crash).
+  `bovine_stub.s` now hands over through a table of absolute (EXT20) JMPs,
+  reached with XK = 0 and a small IX: the same address under either reading.
+- `make bovine-stubfix BASE=readback.bin` repairs a chip that carries the 1.4.0
+  stub WITHOUT an erase: `bovine_stubfix.s` turns the old stub's `BNE SUM`
+  (`B6 E0`) into `BRA` (`B0 40`, bits cleared only) into a corrected stub in the
+  blank space after it. Verified on silicon.
+- TMSK2's prescaler field (CPR) is write-once after reset (manual 8.7). The
+  1.3.0/1.4.0 window wrote /256 and CHAIN's restore to /4 was ignored, so the
+  host still ran 64x slow (the 1.4.0 "fix" passed only in the emulator). The
+  window now runs on the untouched reset prescaler (TCNT wraps 64x a second,
+  `BOVTICKS = BOVSECS*64`) and nothing writes TMSK2. Verified on silicon (the
+  host's 10 s timer fires at 10 s after the chain).
+- `bovine_tramp.s` (a 4-byte slot body that jumps to another slot's cow) and
+  `bovine_beacon.s` (prints a slot's header and sum as the CPU reads them, then
+  jumps on): the diagnostics used to find the above.
+
 ## 1.4.0
 
 - Bovine slots: `bovine_stub.s`, grafted once in the cow's place, boots the

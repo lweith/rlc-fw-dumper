@@ -64,8 +64,8 @@ SWSR    EQU     $FA27           ; COP service register ($FFA27 with EK=$F)
         IF      (SLOT0 & $FFFF) <> 0
         ERROR   "SLOT0 must start a 64 KB bank"
         ENDIF
-        IF      (SLOTSZ & (SLOTSZ-1)) <> 0 || SLOTSZ < 4096 || SLOTSZ > 32768
-        ERROR   "SLOTSZ must be a power of two from 4K to 32K"
+        IF      SLOTSZ <> $2000
+        ERROR   "the hand-over's slot-index arithmetic assumes 8 KB slots"
         ENDIF
         IF      SLOT0+NSLOTS*SLOTSZ > $80000
         ERROR   "slots run past the 512 KB ROM"
@@ -113,20 +113,48 @@ SUM:
         XGDZ                    ; D = sum
         CPD     4,X
         BNE     NEXT            ; damaged, partly programmed or over stuck bits
-        ; good slot: hand over in the reset state the cow expects
+
+        ; Good slot at XK:X.  Hand over through a table of absolute (EXT20)
+        ; JMPs.  NOT  JMP 8,X : the 20-bit indexed mode adds its offset to the
+        ; 16-bit IX only, not XK (User's Manual 5.5.3; the 8/16-bit and
+        ; E-offset modes do use XK), so the bank must come from the offset --
+        ; 1.4.0 did that and landed in bank 0 on silicon.  Table index =
+        ; ((XK - SLOT0 bank) * slots/bank + X / SLOTSZ) * 4, reached with
+        ; XK = 0 and a small IX: the same address under either reading.
+        ; (the same instruction sequence as bovine_stubfix.s, which ran on
+        ; silicon; 8 KB slots: 8 per bank, X / $2000 * 4 = X >> 11)
+        TXKB
+        SUBB    #(SLOT0>>16)
+        LSLB
+        LSLB
+        LSLB
+        LSLB
+        LSLB                    ; B = bank * 32
+        CLRA
+        TDE                     ; E = bank * 32
+        XGDX                    ; D = X (slot offset in its bank)
+        LSRA
+        LSRA
+        LSRA                    ; A = X >> 11 = slot-in-bank * 4
+        TAB
+        CLRA
+        ADE                     ; E = table offset
+        TED
+        XGDX                    ; X = table offset (small, positive)
         LDZ     #HOSTIZ
         CLRB
         TBEK                    ; EK = 0
-        JMP     HDRSZ,X         ; PK:PC <- XK:X+8  (XK = the slot's bank)
+        TBXK                    ; XK = 0
+        JMP     TABLE,X
 
 NEXT:
-        ; IX is 20 bits (XK:X): AIX borrows out of XK by itself at a bank
-        ; boundary.  SLOT0 starts a bank, so stepping below it leaves XK one
-        ; bank lower -- that is the end of the scan.
+        ; AIX is a 20-bit add (manual: XK:IX + IMM => XK:IX): it borrows out of
+        ; XK at a bank boundary.  SLOT0 starts a bank, so stepping below it
+        ; leaves XK one bank lower -- that is the end of the scan.
         AIX     #-SLOTSZ
         TXKB
         CMPB    #(SLOT0>>16)
-        BHS     PROBE
+        LBCC    PROBE           ; BHS (long: PROBE is out of short range)
 
 NONE:
         ; no good slot: chain to the host as reset left the CPU
@@ -135,6 +163,14 @@ NONE:
         TBEK                    ; EK = 0
         TBXK                    ; XK = 0 (host bank)
         LDX     #HOSTPC
-        JMP     0,X
+        JMP     0,X             ; IX + 0 in bank 0 (as CHAIN; proven on silicon)
+
+        ALIGN   2
+TABLE:
+I       SET     0
+        WHILE   I < NSLOTS
+        JMP     SLOT0+I*SLOTSZ+HDRSZ    ; EXT20: absolute
+I       SET     I+1
+        ENDM
 
         END
