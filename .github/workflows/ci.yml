@@ -11,6 +11,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write     # gh release create on v* tags
     steps:
       - uses: actions/checkout@v4
         with:
@@ -109,3 +111,19 @@ jobs:
             boot_stub.bin
             rom_patch.bin
           if-no-files-found: error
+
+      # On a version tag, publish the images as a GitHub Release, named for
+      # the version so a burned chip can be traced back to its build.
+      - name: Publish release images
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          for f in sram_dump boot_stub rom_patch; do
+            cp "$f.bin" "dist/rlc-cow-${tag}-${f}.bin"
+          done
+          (cd dist && sha256sum *.bin > "rlc-cow-${tag}-SHA256SUMS")
+          gh release create "$tag" dist/* --title "$tag" --verify-tag \
+            --notes "Built by CI from $(git rev-parse --short HEAD) with asl 1.42 Bld 307."
