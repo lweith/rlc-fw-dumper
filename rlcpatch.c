@@ -19,7 +19,21 @@
  *   rlcpatch bovine --fw FW --cow COW --base BOVBASE --out OUT
  *       Graft the cow (assembled at BOVBASE) into FW and redirect the reset
  *       vector to it, preserving the host's SP/IZ and saving its entry for the
- *       cow's CHAIN.  Full image -> erase + burn.
+ *       cow's CHAIN.  Full image -> erase + burn.  Also grafts bovine_stub.s.
+ *
+ * Bovine slots (bovine_stub.s): the layout options --slot0 --slotsz --nslots
+ * must match the burned stub.
+ *   rlcpatch nextslot --base IMG [layout]
+ *       Print the address of the first slot above every used one (where the
+ *       next cow goes: the stub boots the highest good slot).
+ *   rlcpatch bovslot --base IMG --cow BODY --at ADDR --out OUT [layout]
+ *       Wrap BODY (a cow assembled at ADDR+8) in the slot header (magic,
+ *       length, 16-bit word sum) and overlay it at ADDR without an erase
+ *       (refused if any byte needs a 0->1 change, e.g. over a stuck bit).
+ *   rlcpatch revoke --base IMG --at ADDR --out OUT [layout]
+ *       Zero the slot's first byte: the stub skips it (falls back).
+ *   rlcpatch bovslots --base IMG [layout]
+ *       List the slots: blank, revoked, good, or bad (and which the stub boots).
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -140,7 +154,7 @@ static int cmd_overlay(int argc, char **argv)
         else if (strcmp(argv[i], "--size") == 0) size = parse_num(opt_val(argc, argv, &i, "--size"));
         else break;      /* remaining args are ADDR:FILE regions */
     }
-    if (!base || !out || slotsz <= 0) {
+    if (!base || !out || slotsz < 0) {
         fprintf(stderr, "usage: %s overlay --base BASE|- --out OUT --slotsz N "
                 "[--size N] ADDR:FILE...\n", prog);
         return 1;
@@ -160,9 +174,11 @@ static int cmd_overlay(int argc, char **argv)
         }
     }
 
-    printf("live slots before: ");
-    print_slots(img, size, slotsz);
-    printf("\n");
+    if (slotsz > 0) {       /* --slotsz 0: not an append-only slot ROM */
+        printf("live slots before: ");
+        print_slots(img, size, slotsz);
+        printf("\n");
+    }
 
     for (; i < argc; i++) {
         char *spec = argv[i];
@@ -215,9 +231,11 @@ static int cmd_overlay(int argc, char **argv)
 
     write_file(out, img, size);
     printf("%s: %ld byte(s) newly programmed vs base\n", out, changed);
-    printf("live slots after:  ");
-    print_slots(img, size, slotsz);
-    printf("\n");
+    if (slotsz > 0) {
+        printf("live slots after:  ");
+        print_slots(img, size, slotsz);
+        printf("\n");
+    }
     free(img);
     return 0;
 }
@@ -311,11 +329,159 @@ static int cmd_bovine(int argc, char **argv)
     return 0;
 }
 
+/* --- bovine slots ---------------------------------------------------------- */
+
+#define BS_MAGIC 0xC057
+#define BS_HDR   8
+
+struct bslayout { long slot0, slotsz, nslots; };
+
+/* Parse the layout options out of argv (consuming them); defaults match the
+ * defaults in bovine_stub.s.  Unknown args are left for the caller. */
+static int bs_opt(int argc, char **argv, int *i, struct bslayout *l)
+{
+    if (strcmp(argv[*i], "--slot0") == 0) l->slot0 = parse_num(opt_val(argc, argv, i, "--slot0"));
+    else if (strcmp(argv[*i], "--slotsz") == 0) l->slotsz = parse_num(opt_val(argc, argv, i, "--slotsz"));
+    else if (strcmp(argv[*i], "--nslots") == 0) l->nslots = parse_num(opt_val(argc, argv, i, "--nslots"));
+    else return 0;
+    return 1;
+}
+
+/* 0 blank ($FF first byte), 1 revoked ($00), 2 good, 3 bad (other) */
+static int bs_state(const unsigned char *img, long a, long slotsz)
+{
+    long len, k;
+    unsigned sum = 0;
+    if (img[a] == 0xFF) return 0;
+    if (img[a] == 0x00) return 1;
+    if (rdword(img, a) != BS_MAGIC) return 3;
+    len = rdword(img, a + 2);
+    if (len == 0 || len > slotsz - BS_HDR || (len & 1)) return 3;
+    for (k = 0; k < len; k += 2)
+        sum = (sum + rdword(img, a + BS_HDR + k)) & 0xFFFF;
+    return sum == (unsigned)rdword(img, a + 4) ? 2 : 3;
+}
+
+static const char *bs_name[] = { "blank", "revoked", "good", "BAD" };
+
+static void bs_list(const unsigned char *img, const struct bslayout *l)
+{
+    long i, boot = -1;
+    for (i = l->nslots - 1; i >= 0 && boot < 0; i--)
+        if (bs_state(img, l->slot0 + i * l->slotsz, l->slotsz) == 2)
+            boot = i;
+    for (i = 0; i < l->nslots; i++) {
+        long a = l->slot0 + i * l->slotsz;
+        int s = bs_state(img, a, l->slotsz);
+        if (s != 0)
+            printf("  slot %2ld @ $%05lX  %s%s\n", i, a, bs_name[s], i == boot ? "  <- boots" : "");
+    }
+    if (boot < 0)
+        printf("  no good slot: the stub chains straight to the host\n");
+}
+
+static unsigned char *bs_load(const char *base)
+{
+    long len;
+    unsigned char *img = read_file(base, &len);
+    if (len != IMGSZ) {
+        fprintf(stderr, "%s: ERROR: %s is %ld bytes, expected %ld\n", prog, base, len, IMGSZ);
+        exit(1);
+    }
+    return img;
+}
+
+static int cmd_bovslots(int argc, char **argv, int which /*0 list,1 next,2 slot,3 revoke*/)
+{
+    struct bslayout l = { 0x30000L, 0x2000L, 24 };
+    const char *base = NULL, *cow = NULL, *out = NULL;
+    long at = -1, i;
+    int ai;
+    unsigned char *img;
+    for (ai = 0; ai < argc; ai++) {
+        if (bs_opt(argc, argv, &ai, &l)) continue;
+        if (strcmp(argv[ai], "--base") == 0) base = opt_val(argc, argv, &ai, "--base");
+        else if (strcmp(argv[ai], "--cow") == 0) cow = opt_val(argc, argv, &ai, "--cow");
+        else if (strcmp(argv[ai], "--out") == 0) out = opt_val(argc, argv, &ai, "--out");
+        else if (strcmp(argv[ai], "--at") == 0) at = parse_num(opt_val(argc, argv, &ai, "--at"));
+        else { fprintf(stderr, "%s: ERROR: unknown arg '%s'\n", prog, argv[ai]); return 1; }
+    }
+    if (!base || (which >= 2 && (!out || at < 0)) || (which == 2 && !cow)) {
+        fprintf(stderr, "usage: %s {bovslots|nextslot|bovslot|revoke} --base IMG "
+                "[--cow BODY --at ADDR --out OUT] [--slot0 A --slotsz N --nslots N]\n", prog);
+        return 1;
+    }
+    img = bs_load(base);
+    if (which == 0) {
+        bs_list(img, &l);
+        return 0;
+    }
+    if (which == 1) {
+        long next = 0;
+        for (i = 0; i < l.nslots; i++)
+            if (bs_state(img, l.slot0 + i * l.slotsz, l.slotsz) != 0)
+                next = i + 1;
+        if (next >= l.nslots)
+            die("no slot left above the used ones");
+        printf("0x%05lX\n", l.slot0 + next * l.slotsz);
+        return 0;
+    }
+    if (at < l.slot0 || at >= l.slot0 + l.nslots * l.slotsz || (at - l.slot0) % l.slotsz)
+        die("--at is not a slot address of this layout");
+    if (which == 3) {
+        img[at] = 0x00;                 /* always programmable: only clears bits */
+        write_file(out, img, IMGSZ);
+        printf("revoked slot %ld @ $%05lX -> %s\n", (at - l.slot0) / l.slotsz, at, out);
+        bs_list(img, &l);
+        return 0;
+    }
+    {
+        long blen, len, k, nbad = 0;
+        unsigned char *body = read_file(cow, &blen);
+        unsigned char *slot;
+        unsigned sum = 0;
+        len = (blen + 1) & ~1L;
+        if (len + BS_HDR > l.slotsz)
+            die("cow does not fit in a slot");
+        slot = (unsigned char *)malloc((size_t)(len + BS_HDR));
+        if (!slot) die("out of memory");
+        memset(slot, 0xFF, (size_t)(len + BS_HDR));
+        memcpy(slot + BS_HDR, body, (size_t)blen);
+        for (k = 0; k < len; k += 2)
+            sum = (sum + rdword(slot, BS_HDR + k)) & 0xFFFF;
+        wrword(slot, 0, BS_MAGIC);
+        wrword(slot, 2, (int)len);
+        wrword(slot, 4, (int)sum);
+        wrword(slot, 6, 0);
+        for (k = 0; k < len + BS_HDR; k++) {
+            int old = img[at + k], nw = slot[k];
+            if ((old & nw) != nw) {
+                if (nbad < 8)
+                    fprintf(stderr, "  %#07lx: chip %02x -> wanted %02x\n", at + k, old, nw);
+                nbad++;
+            }
+        }
+        if (nbad) {
+            fprintf(stderr, "REFUSED: %ld byte(s) in slot %ld would need a 0->1 bit change "
+                    "(used slot, or stuck bits): pick another slot\n", nbad, (at - l.slot0) / l.slotsz);
+            return 1;
+        }
+        memcpy(img + at, slot, (size_t)(len + BS_HDR));
+        write_file(out, img, IMGSZ);
+        printf("slot %ld @ $%05lX: %ld-byte cow, sum $%04X -> %s\n",
+               (at - l.slot0) / l.slotsz, at, blen, sum, out);
+        bs_list(img, &l);
+        free(body);
+        free(slot);
+    }
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
         fprintf(stderr, "usage: %s {overlay|probe|probe-pc|probe-iz|probe-pk|"
-                "bovine} ...\n", prog);
+                "bovine|bovslots|nextslot|bovslot|revoke} ...\n", prog);
         return 1;
     }
     if (strcmp(argv[1], "overlay") == 0)
@@ -330,6 +496,14 @@ int main(int argc, char **argv)
         return cmd_probe(argv[2], 3);
     if (strcmp(argv[1], "bovine") == 0)
         return cmd_bovine(argc - 2, argv + 2);
+    if (strcmp(argv[1], "bovslots") == 0)
+        return cmd_bovslots(argc - 2, argv + 2, 0);
+    if (strcmp(argv[1], "nextslot") == 0)
+        return cmd_bovslots(argc - 2, argv + 2, 1);
+    if (strcmp(argv[1], "bovslot") == 0)
+        return cmd_bovslots(argc - 2, argv + 2, 2);
+    if (strcmp(argv[1], "revoke") == 0)
+        return cmd_bovslots(argc - 2, argv + 2, 3);
     fprintf(stderr, "%s: ERROR: unknown subcommand '%s'\n", prog, argv[1]);
     return 1;
 }

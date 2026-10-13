@@ -19,6 +19,7 @@ make OUT=recover.bin  # name the output image
 make clean all        # force a full rebuild
 make patch SLOT=n     # append-only slot build (see "Append-only boot ROM")
 make bovine FW=host.bin  # graft onto a host firmware (see "Bovine bootloader")
+make bovine-slots FW=host.bin BASE=blank.bin  # stub + slot 0 (see "Bovine slots")
 ```
 
 The `patch` and `bovine` targets use `rlcpatch`, a small C image-surgery helper
@@ -169,8 +170,61 @@ architected reset vector, so the hand-off owes nothing to the host's internals:
   a non-512 KB image, a non-bank-0 host entry, an unaligned base, a cow that
   straddles a 64 KB bank, or a landing zone that is not all `$FF`.
 
+- **Everything the cow programs before chaining is undone or rewritten.** A
+  chain is not a reset, so a register the cow sets and the host leaves at its
+  reset value would carry over. The window's GPT prescaler (`TMSK2`, /256) did
+  exactly that in 1.3.0: a host that never writes `TMSK2` ran its whole GPT
+  timebase 64× slow (fixed in 1.3.1: `CHAIN` restores the reset value). The
+  rule for any future change: whatever the cow writes before `CHAIN` is restored
+  there, unless the host is known to rewrite it.
+
 Unlike the slot scheme this is **not** an additive burn: redirecting the reset
-vector needs 0→1 changes, so a UV part must be erased first.
+vector needs 0→1 changes, so a UV part must be erased first — unless the
+grafted piece is the slot stub below.
+
+## Bovine slots — one last erase, then additive
+
+`bovine_stub.s` is grafted in the cow's place **once**; cows then go into
+append-only slots in the host's blank space and are added later onto the
+already-burned chip without erasing (programming only clears bits).
+
+- Layout (fixed for the life of the chip once the stub is burned; Makefile
+  `STUBBASE BSLOT0 BSLOTSZ BNSLOTS`): stub at `$2D000`, 24 slots of 8 KB from
+  `$30000` — the blank `$2C86D-$5FFFF` run of the v2.16 base `Club.bin`.
+- Slot: `+0` `$C057`, `+2` body length, `+4` 16-bit sum of the body's words,
+  `+6` 0, `+8` a bovine cow assembled to run there.
+- The stub scans from the **top** slot down and jumps to the first with the
+  magic, a sane length **and a matching sum**: a half-programmed slot, one over
+  a stuck bit, or one revoked (first byte programmed to `$00`) is skipped and
+  the next lower one tried. **No good slot → it chains straight to the host**,
+  so revoking every slot gives back the plain host without an erase.
+- It writes no configuration registers; it services the COP while summing (the
+  COP is enabled from reset), and leaves EK/XK = 0 and IZ = the host's, as the
+  reset vector had them.
+
+```
+minipro -p DEV -E; minipro -p DEV -r blank.bin        # erase, read the blank chip back
+make bovine-slots FW=Club.bin BASE=blank.bin          # stub + this cow in slot 0
+minipro -p DEV -w bovslots.bin                        # the last erase-and-burn
+# later, a new cow:
+minipro -p DEV -r now.bin
+make bovine-slot FW=Club.bin BASE=now.bin             # next slot above the used ones
+minipro -p DEV -w bovslots.bin                        # additive: no erase
+make bovine-revoke BASE=now.bin AT=0x32000            # retire a slot (falls back)
+./rlcpatch bovslots --base now.bin                    # blank / revoked / good / BAD
+```
+
+`BASE=blank.bin` on the first build checks every byte against the erased chip,
+so a bit stuck at 0 refuses the build instead of burning a broken image; later
+builds overlay onto a readback the same way, and refuse a slot that is in use
+or sits over stuck bits (pick another with `AT=`).
+
+Verified in MAME (base `rlcclub`, `Club-v2.16`): stub → slot 0 → chain gives the
+host's stock timing (timer to the 10 ms, CW ID to the 20 ms); an appended slot 1
+is chosen over slot 0; slot 1 with one cleared body bit is rejected and slot 0
+boots; slot 1 revoked → slot 0; every slot revoked → the host boots directly
+with stock timing; `rptcfg upload` breaks into a slot cow, reads the whole SRAM
+and returns to the host.
 
 Verified in MAME against `ClubDlx2-v2.16`: the window elapsing boots stock
 `V2.16dlx2` cleanly to `DTMF>`, and a keypress drops into the monitor

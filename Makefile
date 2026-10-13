@@ -92,7 +92,7 @@ BOVBASE ?= 0x2D000
 BOVOUT  ?= bovine.bin
 PATCHER := rlcpatch
 
-.PHONY: all clean stub patch bovine FORCE
+.PHONY: all clean stub patch bovine bovine-slots bovine-slot bovine-revoke FORCE
 
 all: $(OUT)
 
@@ -131,6 +131,67 @@ bovine: $(SRC) $(STAGE) $(IDSTAGE) $(PATCHER)
 		--base $(BOVBASE) --out $(BOVOUT)
 	@echo "burn:   minipro -p $(DEV) -w $(BOVOUT)    (UV EPROM: erase first)"
 
+# --- Bovine slots (`make bovine-slots FW=host.bin`) --------------------------
+# bovine_stub.s is grafted ONCE where the cow used to go and owns the reset
+# vector; cows go into append-only slots in the host's blank space, added later
+# without erasing. The layout is FIXED for the life of the chip once the stub
+# is burned: every later build must use the same values.
+#   make bovine-slots FW=host.bin [BASE=blank.bin]     first burn (ERASE + burn):
+#        stub + this cow in slot 0. BASE = a readback of the ERASED chip: the
+#        image is checked against it, so a stuck bit refuses the build.
+#   make bovine-slot FW=host.bin BASE=now.bin [AT=addr] append this cow to the
+#        next free slot (or AT) of a chip readback -> burn WITHOUT erasing
+#   make bovine-revoke BASE=now.bin AT=addr             retire a slot (falls back)
+#   ./rlcpatch bovslots --base now.bin                  list the slots
+STUBBASE ?= 0x2D000
+BSLOT0   ?= 0x30000
+BSLOTSZ  ?= 0x2000
+BNSLOTS  ?= 24
+BSOUT    ?= bovslots.bin
+BSLAYOUT  = --slot0 $(BSLOT0) --slotsz $(BSLOTSZ) --nslots $(BNSLOTS)
+AT       ?=
+
+# the cow, assembled to run at slot address $(1) + 8 (after the header)
+define bovcow
+	$(ASL) -cpu $(CPU) -D SCBRVAL=$(SCBR) -D BOVINE -D BOVBASE=$$(( $(1) + 8 )) \
+		$(if $(BOVSECS),-D BOVSECS=$(BOVSECS)) \
+		-D HOSTPC=`./$(PATCHER) probe-pc "$(FW)"` \
+		-D HOSTIZ=`./$(PATCHER) probe-iz "$(FW)"` \
+		-o bovcow.p -olist bovcow.lst -L $(SRC)
+	$(P2BIN) bovcow.p bovcow_raw.bin -l $(FILL)
+endef
+
+bovine-slots: $(SRC) bovine_stub.s $(STAGE) $(IDSTAGE) $(PATCHER)
+	@test -n "$(FW)" || { echo "usage: make bovine-slots FW=host.bin [BASE=erased-readback.bin]"; exit 1; }
+	$(ASL) -cpu $(CPU) -D STUBBASE=$(STUBBASE) -D SLOT0=$(BSLOT0) -D SLOTSZ=$(BSLOTSZ) \
+		-D NSLOTS=$(BNSLOTS) \
+		-D HOSTPC=`./$(PATCHER) probe-pc "$(FW)"` \
+		-D HOSTIZ=`./$(PATCHER) probe-iz "$(FW)"` \
+		-o bovine_stub.p -olist bovine_stub.lst -L bovine_stub.s
+	$(P2BIN) bovine_stub.p bovine_stub_raw.bin -l $(FILL)
+	$(call bovcow,$(BSLOT0))
+	./$(PATCHER) bovine --fw "$(FW)" --cow bovine_stub_raw.bin --base $(STUBBASE) --out bovstub.tmp
+	./$(PATCHER) bovslot --base bovstub.tmp --cow bovcow_raw.bin --at $(BSLOT0) --out $(BSOUT) $(BSLAYOUT)
+	@if [ "$(BASE)" != "-" ]; then \
+		./$(PATCHER) overlay --base "$(BASE)" --out $(BSOUT) --slotsz 0 0:$(BSOUT) || exit 1; \
+		echo "checked against the erased chip $(BASE): every byte programmable"; \
+	fi
+	@rm -f bovstub.tmp
+	@echo "burn:   minipro -p $(DEV) -w $(BSOUT)    (UV EPROM: erase first; the last erase)"
+
+bovine-slot: $(SRC) $(STAGE) $(IDSTAGE) $(PATCHER)
+	@test -n "$(FW)" -a "$(BASE)" != "-" || { echo "usage: make bovine-slot FW=host.bin BASE=readback.bin [AT=slot-address]"; exit 1; }
+	$(eval SLOTAT := $(or $(AT),$(shell ./$(PATCHER) nextslot --base "$(BASE)" $(BSLAYOUT))))
+	@test -n "$(SLOTAT)" || { echo "no free slot"; exit 1; }
+	$(call bovcow,$(SLOTAT))
+	./$(PATCHER) bovslot --base "$(BASE)" --cow bovcow_raw.bin --at $(SLOTAT) --out $(BSOUT) $(BSLAYOUT)
+	@echo "burn:   minipro -p $(DEV) -w $(BSOUT)    (NO erase: add -e)"
+
+bovine-revoke: $(PATCHER)
+	@test "$(BASE)" != "-" -a -n "$(AT)" || { echo "usage: make bovine-revoke BASE=readback.bin AT=slot-address"; exit 1; }
+	./$(PATCHER) revoke --base "$(BASE)" --at $(AT) --out $(BSOUT) $(BSLAYOUT)
+	@echo "burn:   minipro -p $(DEV) -w $(BSOUT)    (NO erase: add -e)"
+
 # Rebuild whenever the source, the banner or the identification changes.
 $(OUT): $(SRC) $(STAGE) $(IDSTAGE)
 	$(ASL) -cpu $(CPU) -D SCBRVAL=$(SCBR) -L $(SRC)
@@ -155,4 +216,6 @@ FORCE:
 clean:
 	rm -f $(OUT) $(STAGE) $(IDSTAGE) *.tmp $(STEM).p $(STEM).lst $(STUB).p $(STUB).lst \
 		$(STUB).bin $(STUB)_raw.bin slot*.p slot*.lst slot*_raw.bin $(PATCH) \
-		bovine.p bovine.lst bovine_raw.bin $(BOVOUT) $(PATCHER)
+		bovine.p bovine.lst bovine_raw.bin $(BOVOUT) $(PATCHER) \
+		bovine_stub.p bovine_stub.lst bovine_stub_raw.bin bovcow.p bovcow.lst bovcow_raw.bin \
+		bovstub.tmp $(BSOUT)

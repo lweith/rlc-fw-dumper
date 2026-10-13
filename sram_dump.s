@@ -792,6 +792,13 @@ MON_J:
 ; PK nibble is 0 before it builds the image.
 ;-----------------------------------------------------------------------
 CHAIN:
+        ; Undo what the escape window set up: the GPT prescaler (TMSK2) goes
+        ; back to its reset value, CPR=000 (system clock / 4).  A host that
+        ; leaves TMSK2 at its reset value -- a chain is not a reset -- would
+        ; otherwise run its GPT 64x slow (/256).  GPTMCR was written with its
+        ; reset value ($0000) already.  EK is still $F here.
+        CLRB
+        STAB    TMSK2                   ; prescale = system clock / 4 (reset)
         ; Leave the SCI as-is -- the host reinitialises SCCR0/1 at its own reset,
         ; and not touching it here lets the "booting host..." line finish
         ; transmitting before we jump.

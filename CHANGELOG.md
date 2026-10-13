@@ -2,6 +2,20 @@
 
 Versions follow semver as described under "Versioning" in `README.md`.
 
+## 1.4.0
+
+- Bovine slots: `bovine_stub.s`, grafted once in the cow's place, boots the
+  highest slot whose header and 16-bit sum check out, from 24 append-only 8 KB
+  slots in the host's blank space; no good slot chains straight to the host.
+  New cows are added and old ones revoked without erasing the chip.
+  `make bovine-slots` (first burn, checked against a readback of the erased
+  chip so stuck bits refuse the build), `make bovine-slot`, `make bovine-revoke`;
+  `rlcpatch bovslots|nextslot|bovslot|revoke`. `BOVSECS=` reaches slot builds.
+- Fix (1.3.1 content): `CHAIN` restores the GPT prescaler (`TMSK2`) to its reset
+  value. 1.3.0 left it at /256 from the escape window, and a host that relies on
+  the reset value ran its GPT timebase 64× slow on every bovine boot (stock
+  RLC-Club v2.16: 10 ms tick -> 640 ms; timers, CW and pacing all 64× slow).
+
 ## 1.3.0
 
 - Bovine escape window is now timed by the on-chip GPT free-running counter
