@@ -16,8 +16,29 @@ jobs:
         with:
           fetch-depth: 0      # tags, so version.sh resolves a real version
 
-      - name: Install the AS macroassembler (asl + p2bin)
-        run: sudo apt-get update && sudo apt-get install -y asl
+      # AS isn't packaged for Ubuntu; build the pinned upstream snapshot
+      # (same build as the dev box) and cache the two binaries.
+      - name: Cache the AS macroassembler
+        id: asl-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/asl/bin
+          key: asl-142-bld307-${{ runner.os }}
+
+      - name: Build the AS macroassembler (asl + p2bin)
+        if: steps.asl-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -fsSL -o /tmp/asl.tar.gz \
+            http://john.ccac.rwth-aachen.de:8000/ftp/as/source/c_version/asl-current-142-bld307.tar.gz
+          tar -C /tmp -xzf /tmp/asl.tar.gz
+          cd /tmp/asl-current
+          cp Makefile.def-samples/Makefile.def-x86_64-unknown-linux Makefile.def
+          make -j"$(nproc)" binaries
+          mkdir -p ~/asl/bin
+          cp asl p2bin ~/asl/bin/
+
+      - name: Put AS on PATH
+        run: echo "$HOME/asl/bin" >> "$GITHUB_PATH"
 
       - name: Tool versions
         run: |
