@@ -5,7 +5,7 @@
 # version.sh - print what this checkout builds as: the version, the branch and
 # the commit date, one per line. The Makefile embeds them in the image.
 #
-#   at tag vX.Y.Z, clean          X.Y.Z+gHASH
+#   at tag vX.Y.Z, clean          X.Y.Z+gHASH  (branch reported as "release")
 #   N commits past vX.Y.Z         X.Y.(Z+1)-dev.N+gHASH   (a pre-release of the
 #                                 next patch, so it sorts above X.Y.Z)
 #   uncommitted changes           ... +gHASH.dirty
@@ -48,5 +48,8 @@ fi
 
 branch=$(git rev-parse --abbrev-ref HEAD)
 [ "$branch" = HEAD ] && branch=detached
+# a clean release tag names itself, not the checkout: building v1.5.0 on main,
+# on a detached tag checkout or in CI gives the same bytes
+[ -n "$d" ] && [ "$n" -eq 0 ] && [ -z "$dirty" ] && branch=release
 
 printf '%s\n' "$version" "$branch" "$(git log -1 --format=%cs HEAD)"

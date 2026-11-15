@@ -65,6 +65,7 @@ DDRQS   EQU     $17             ; QSM data-direction register  $FFC17
 ; SCI status bit masks (within the byte tested):
 TDRE    EQU     $01             ; SCSR bit 8  -> bit0 of high byte
 RDRF    EQU     $40             ; SCSR bit 6  -> bit6 of low  byte
+TC      EQU     $80             ; SCSR bit 7  -> bit7 of low  byte (transmit complete)
 ;
 ; SCI setup values:
 ;   Baud = f_sys / (32 * SCBR), SCBR integer.  At f_sys = 16.777216 MHz:
@@ -146,6 +147,7 @@ CMD_X   EQU     $58             ; 'X' : read SYNCR (clock/SLOCK) -> hi,lo
 CMD_J   EQU     $4A             ; 'J' : jump hi,lo (bank-0 program space; experimental)
 CMD_S   EQU     $53             ; 'S' : boot slot index -> 1 byte ($FF = not slotted)
 CMD_I   EQU     $49             ; 'I' : identify -> "VERSION (BRANCH, DATE)",CR,LF
+CMD_B   EQU     $42             ; 'B' : reboot -> 'K', then a hardware reset (DS1232)
 ACKCHR  EQU     $4B             ; 'K' : write acknowledge
 
 ;-----------------------------------------------------------------------
@@ -673,6 +675,7 @@ DONE:
 ;   'J' hi lo                -> JMP to bank-0 program address hi:lo (experimental)
 ;   'S'                      -> boot slot index, 1 byte ($FF = not slotted)
 ;   'I'                      -> "VERSION (BRANCH, DATE)",CR,LF  (which build)
+;   'B'                      -> 'K', then the board resets (see MON_B)
 ; 'V' stays "COW1": it names the monitor protocol revision, not the build.
 ; The monitor uses NO RAM: addresses are assembled in registers (GETADR), so
 ; R/W can probe module registers (e.g. the chip selects) even when external
@@ -712,6 +715,8 @@ MONLOOP:
         LBEQ    MON_S
         CMPB    #CMD_I
         LBEQ    MON_I
+        CMPB    #CMD_B
+        LBEQ    MON_B
         BRA     MONLOOP         ; unknown command -> ignore, resync
 
 MON_V:
@@ -773,6 +778,27 @@ MON_I:
         LDAB    #LF
         SENDB
         LBRA    MONLOOP
+
+;-----------------------------------------------------------------------
+; MON_B : reboot the board with a real hardware reset.  The monitor cannot
+; jump back to the host: every path into it has written SYPCR (write-once
+; after reset), so a host entered by a jump would have its own SYPCR write
+; ignored and run without the COP it programs.  Instead stop strobing the
+; EXTERNAL DS1232: it pulls /RESET after its timeout (~0.6-1.2 s, TD = VCC),
+; and the board comes up exactly as from power-on -- reset vector, stub/cow
+; window, then the host if no key arrives.  The COP is already off on every
+; monitor path (SYPCR = $00), so nothing else can fire first.  'K' is sent
+; and the spin waits for TC (shift register empty) so the ack is fully on the
+; wire before the CPU goes quiet.  Writes no registers.  Clean-room: DS1232
+; behaviour from the board schematic/HARDWARE_SPEC.md, SCSR TC from the
+; MC68HC16Z1 user's manual.
+;-----------------------------------------------------------------------
+MON_B:
+        LDAB    #ACKCHR
+        SENDB                   ; 'K' (the last strobe the DS1232 gets)
+        BRCLR   SCSR_LO,Z,#TC,* ; wait for the ack to finish transmitting
+MONBLP:
+        BRA     MONBLP          ; no strobe: the DS1232 resets the board
 
 MON_J:
         CLRB

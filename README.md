@@ -51,7 +51,7 @@ commit it names.
 
 | checkout | version |
 |---|---|
-| at tag `vX.Y.Z`, clean | `X.Y.Z+gHASH` |
+| at tag `vX.Y.Z`, clean | `X.Y.Z+gHASH`, branch `release` (so a release builds the same bytes on any checkout, CI included) |
 | N commits past it | `X.Y.(Z+1)-dev.N+gHASH` (pre-release of the next patch) |
 | uncommitted changes | `….dirty` appended |
 | outside git | `0.0.0+unknown`, or `make VERSION=… BRANCH=… CDATE=…` |
@@ -135,6 +135,14 @@ on real silicon, not a cycle-counted guess; `BOVSECS` is the knob):
 - **the window elapses** → it prints `booting host...` (so the hand-off is
   visible on serial), restores a reset CPU state, and jumps to the host's saved
   entry, which boots exactly as if the cow were not there.
+
+To leave the monitor without touching the board, send monitor command `B`
+(1.5.0+): it answers `K` and stops strobing the DS1232, which resets the board
+within its timeout (~0.6–1.2 s). That is a real reset, so the boot runs as from
+power-on: send nothing during the window and the host comes up. The cow cannot
+jump back to the host instead: breaking in wrote `SYPCR`, which is write-once,
+so a host entered by a jump would run without the COP it programs. On a
+standalone dumper chip `B` simply restarts the dumper.
 
 Build the cow against the **matching product's** firmware — base `Club-*.bin`
 for an RLC-Club, `ClubDlx2-*.bin` for a Deluxe II. Grafting the wrong product's

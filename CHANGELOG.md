@@ -2,6 +2,29 @@
 
 Versions follow semver as described under "Versioning" in `README.md`.
 
+## 1.5.0
+
+- Monitor command `B`: reboot. Replies `K`, waits for it to leave the wire,
+  then stops strobing the external DS1232, which pulls /RESET. A host can now
+  break in (e.g. after a `035` reset), dump the SRAM and return the board to
+  its firmware without anyone pressing RESET. It is a hardware reset rather
+  than a jump because every path into the monitor has written the write-once
+  `SYPCR`. Writes no registers. `V` stays `COW1` (an added command is minor).
+  Verified in MAME (DS1232 modelled) on bovine slots over `ClubDlx2-v2.15` and
+  `-v2.16` (break in → `B` → `K` → reset → window → `booting host...` → host
+  banner) and on the standalone dumper (restarts the dumper). Not yet verified
+  on silicon.
+- Release builds are reproducible across checkouts: at a clean `vX.Y.Z` tag
+  the identification's branch field reads `release` instead of the branch
+  (`main`, or `detached` on a tag checkout such as CI's), so the same tag gives
+  the same image bytes wherever it is built.
+
+## 1.4.2
+
+- CI only, no firmware change: GitHub Actions builds asl 1.42 Bld 307 from
+  pinned upstream source and, on a `v*` tag, publishes the versioned cow-chip
+  images with their SHA-256 sums as a release.
+
 ## 1.4.1
 
 Three silicon facts the emulator did not model; all found on a real RLC-Club
